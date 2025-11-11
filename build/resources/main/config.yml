@@ -1,0 +1,6 @@
+# Bot WebSocket endpoint (the bot runs ws server at /mcws)
+ws-url: "ws://192.162.2.122:8765/mcws"
+
+# Shown in Discord when the server connects (status messages)
+server-name: "Artists MC Realm"
+
