@@ -1,6 +1,21 @@
 # Bot WebSocket endpoint (the bot runs ws server at /mcws)
-ws-url: "ws://192.162.2.122:8765/mcws"
+ws-url: "ws://127.0.0.1:8765/mcws"
 
 # Shown in Discord when the server connects (status messages)
 server-name: "Artists MC Realm"
 
+ssl:
+  # system | ca-pem | pinned
+  mode: system
+
+  # If mode = ca-pem: path to a PEM file containing a CA certificate or
+  # the server certificate to trust (relative to plugins/KavexLink/ by default).
+  ca-pem: "ca.pem"
+
+  # If mode = pinned: expected SHA-256 of the server's SPKI (public key).
+  # Accepts hex with or without colons, case-insensitive.
+  pinned-sha256: "AB:CD:EF:12:34:...:9A"
+
+  # Optional: override SNI/hostname used for verification.
+  # If omitted, Java uses the host from the ws-url.
+  hostname: "bot.kavocado.net"
