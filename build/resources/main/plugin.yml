@@ -1,7 +1,0 @@
-name: KavexLink
-main: net.kavocado.kavexlink.KavexLinkPlugin
-version: 0.1.0
-api-version: '1.20'
-author: GenericRikka
-description: Bi-directional Discord↔Minecraft chat via your Discord bot WebSocket
-
