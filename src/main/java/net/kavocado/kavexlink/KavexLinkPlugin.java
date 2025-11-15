@@ -3,6 +3,8 @@ package net.kavocado.kavexlink;
 import org.bukkit.Bukkit;
 import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 
 import java.io.BufferedInputStream;
 import java.io.InputStream;
@@ -193,6 +195,18 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 TrustManagerFactory.getDefaultAlgorithm());
         tmf.init(ks);
         return tmf;
+    }
+    
+    private String hexToMinecraftColor(String hex) {
+        if (hex == null) return "§f";
+        hex = hex.trim();
+        if (hex.length() != 7 || !hex.startsWith("#")) return "§f";
+        String digits = hex.substring(1); // RRGGBB
+        StringBuilder sb = new StringBuilder("§x");
+        for (char c : digits.toCharArray()) {
+            sb.append('§').append(Character.toLowerCase(c));
+        }
+        return sb.toString();
     }
 
     private Path resolvePath(String p) {
@@ -454,28 +468,46 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         switch (op) {
             case "dc_chat": {
                 String user = obj.has("user") && !obj.get("user").isJsonNull()
-                        ? obj.get("user").getAsString()
-                        : "discord";
+                    ? obj.get("user").getAsString()
+                    : "discord";
                 String guild = obj.has("guild") && !obj.get("guild").isJsonNull()
-                        ? obj.get("guild").getAsString()
-                        : "guild";
+                    ? obj.get("guild").getAsString()
+                    : "guild";
                 String text = obj.has("text") && !obj.get("text").isJsonNull()
-                        ? obj.get("text").getAsString()
-                        : "";
+                    ? obj.get("text").getAsString()
+                    : "";
+
+                String prefix = obj.has("prefix") && !obj.get("prefix").isJsonNull()
+                    ? obj.get("prefix").getAsString()
+                    : "";
+                String colorHex = obj.has("color") && !obj.get("color").isJsonNull()
+                    ? obj.get("color").getAsString()
+                    : null;
+
+                String colorCode = hexToMinecraftColor(colorHex);
+                String prefixPart = prefix.isEmpty() ? "" : prefix + " ";
 
                 final String finalMsg =
-                        "§d" + user + "§r" + "§1@" + "§r" + "§5" + guild + "§r" + ": " + text;
+                    colorCode
+                    + prefixPart
+                    + user
+                    + "§r§7@" + guild + ": "
+                    + text;
 
                 Bukkit.getScheduler().runTask(this,
-                        () -> Bukkit.broadcastMessage(finalMsg));
+                    () -> Bukkit.broadcastMessage(finalMsg));
                 getLogger().info("Broadcasted dc_chat from " + user + "@" + guild);
                 break;
             }
-            case "auth": {
+	    case "auth": {
                 getLogger().info("WS auth ack: " + json);
                 break;
             }
-            default: {
+            case "dc_admin": {
+                handleDcAdmin(obj);
+                break;
+            }
+	    default: {
                 getLogger().info("WS unknown op: " + op);
                 break;
             }
@@ -527,6 +559,136 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         } catch (Exception ignored) {
         }
     }
+
+    // ---- Admin commands ----
+    
+    private void handleDcAdmin(JsonObject obj) {
+        String action = obj.has("action") && !obj.get("action").isJsonNull()
+                ? obj.get("action").getAsString().toLowerCase()
+                : "";
+        String player = obj.has("player") && !obj.get("player").isJsonNull()
+                ? obj.get("player").getAsString()
+                : "";
+        String reason = obj.has("reason") && !obj.get("reason").isJsonNull()
+                ? obj.get("reason").getAsString()
+                : "";
+        String issuedBy = obj.has("issued_by") && !obj.get("issued_by").isJsonNull()
+                ? obj.get("issued_by").getAsString()
+                : "Discord";
+
+        if (player.isEmpty()) {
+            getLogger().warning("dc_admin: empty player in payload: " + obj);
+            return;
+        }
+
+        // Log on the MC side
+        getLogger().info("dc_admin: action=" + action + " player=" + player
+                + " reason=" + reason + " issued_by=" + issuedBy);
+
+        // Run on main thread
+        Bukkit.getScheduler().runTask(this, () -> {
+            switch (action) {
+                case "kick": {
+                    String msg = "Kicked by " + issuedBy;
+                    if (!reason.isEmpty()) msg += " (" + reason + ")";
+                    Bukkit.dispatchCommand(
+                            Bukkit.getConsoleSender(),
+                            "kick " + player + " " + msg
+                    );
+                    break;
+                }
+                case "ban": {
+                    String msg = "Banned by " + issuedBy;
+                    if (!reason.isEmpty()) msg += " (" + reason + ")";
+                    Bukkit.dispatchCommand(
+                            Bukkit.getConsoleSender(),
+                            "ban " + player + " " + msg
+                    );
+                    break;
+                }
+                // easy to extend:
+                case "pardon": {
+                    Bukkit.dispatchCommand(
+                            Bukkit.getConsoleSender(),
+                            "pardon " + player
+                    );
+                    break;
+                }
+                case "command": {
+                    // OPTIONAL: allow arbitrary console commands from Discord
+                    if (obj.has("console") && !obj.get("console").isJsonNull()) {
+                        String cmd = obj.get("console").getAsString();
+                        getLogger().info("dc_admin console command from " + issuedBy + ": " + cmd);
+                        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+                    }
+                    break;
+                }
+                default: {
+                    getLogger().warning("dc_admin: unknown action '" + action + "'");
+                    break;
+                }
+            }
+        });
+    }
+
+        private String generateLinkCode() {
+        // Simple 8-char alphanumeric code
+        String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        SecureRandom rnd = new SecureRandom();
+        StringBuilder sb = new StringBuilder(8);
+        for (int i = 0; i < 8; i++) {
+            sb.append(chars.charAt(rnd.nextInt(chars.length())));
+        }
+        return sb.toString();
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+        if (!cmd.getName().equalsIgnoreCase("linkdiscord")) {
+            return false;
+        }
+
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("Only players can use this.");
+            return true;
+        }
+
+        if (!sender.hasPermission("kavexlink.link")) {
+            sender.sendMessage("You don't have permission to link your account.");
+            return true;
+        }
+
+        WebSocket ws = socketRef.get();
+        if (ws == null) {
+            sender.sendMessage("The Discord bridge is currently offline. Try again later.");
+            return true;
+        }
+
+        String code = generateLinkCode();
+        String uuid = p.getUniqueId().toString().replace("-", "");
+        String name = p.getName();
+
+        // Send link request over WS
+        String payload = "{\"op\":\"mc_link_request\","
+                + "\"uuid\":\"" + uuid + "\","
+                + "\"name\":\"" + escape(name) + "\","
+                + "\"code\":\"" + code + "\"}";
+
+        try {
+            ws.sendText(payload, true);
+        } catch (Exception e) {
+            getLogger().warning("Failed to send mc_link_request: " + e);
+            sender.sendMessage("Failed to contact the Discord bridge. Try again later.");
+            return true;
+        }
+
+        sender.sendMessage("§aYour link code is §e" + code + "§a.");
+        sender.sendMessage("§7Open the Discord server and run §b/linkdiscord " + code + "§7.");
+
+        return true;
+    }
+
+
 
     // ---- Chat capture to Discord ----
 
