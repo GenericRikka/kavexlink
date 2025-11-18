@@ -5,8 +5,14 @@ import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent.Result;
 
 import java.io.BufferedInputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -19,11 +25,14 @@ import java.security.SecureRandom;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
@@ -32,6 +41,8 @@ import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
 import io.papermc.paper.event.player.AsyncChatEvent;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.event.EventHandler;
 import org.bukkit.entity.Player;
@@ -65,6 +76,84 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
     private final AtomicReference<WebSocket> socketRef = new AtomicReference<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
 
+    private final Map<String, PlayerStyle> playerStyles = new ConcurrentHashMap<>();
+    
+    private static class PlayerStyle {
+        final String prefix;
+        final String colorHex;
+        final boolean canKick;
+        final boolean canBan;
+        final boolean canTimeout;
+        final boolean isStaff;
+
+        PlayerStyle(String prefix,
+                    String colorHex,
+                    boolean canKick,
+                    boolean canBan,
+                    boolean canTimeout,
+                    boolean isStaff) {
+            this.prefix = prefix;
+            this.colorHex = colorHex;
+            this.canKick = canKick;
+            this.canBan = canBan;
+            this.canTimeout = canTimeout;
+            this.isStaff = isStaff;
+        }
+    }
+
+    // Moderation storage
+    private File moderationFile;
+    private FileConfiguration moderationConfig;
+
+    private final Map<String, BanEntry> bans = new ConcurrentHashMap<>();
+    private final Map<String, MuteEntry> mutes = new ConcurrentHashMap<>();
+
+    private static class BanEntry {
+        final String uuid;
+        final String name;
+        final long createdAt;
+        final long expiresAt; // 0 = permanent
+        final String reason;
+        final String source;
+
+        BanEntry(String uuid, String name, long createdAt, long expiresAt,
+                 String reason, String source) {
+            this.uuid = uuid;
+            this.name = name;
+            this.createdAt = createdAt;
+            this.expiresAt = expiresAt;
+            this.reason = reason;
+            this.source = source;
+        }
+
+        boolean isActive() {
+            return expiresAt == 0L || expiresAt > System.currentTimeMillis();
+        }
+    }
+
+    private static class MuteEntry {
+        final String uuid;
+        final String name;
+        final long createdAt;
+        final long expiresAt; // 0 = permanent
+        final String reason;
+        final String source;
+
+        MuteEntry(String uuid, String name, long createdAt, long expiresAt,
+                  String reason, String source) {
+            this.uuid = uuid;
+            this.name = name;
+            this.createdAt = createdAt;
+            this.expiresAt = expiresAt;
+            this.reason = reason;
+            this.source = source;
+        }
+
+        boolean isActive() {
+            return expiresAt == 0L || expiresAt > System.currentTimeMillis();
+        }
+    }
+
     @Override
     public void onEnable() {
         running.set(true);
@@ -86,6 +175,11 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         this.sslPinnedSha256 = getConfig().getString("ssl.pinned-sha256", "");
         this.sslHostname     = getConfig().getString("ssl.hostname", "").trim();
         if (this.sslHostname.isEmpty()) this.sslHostname = null;
+
+	// Moderation storage
+        this.moderationFile = dataDir.resolve("moderation.yml").toFile();
+        this.moderationConfig = YamlConfiguration.loadConfiguration(moderationFile);
+        loadModerationData();
 
         // NEW: debug + TLS 1.2 forcing
         this.sslDebug      = getConfig().getBoolean("ssl.debug", false);
@@ -139,9 +233,26 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+	saveModerationData();
         running.set(false);
         WebSocket ws = socketRef.getAndSet(null);
         if (ws != null) ws.abort();
+    }
+
+    private void requestPermStyle(Player player) {
+        WebSocket ws = socketRef.get();
+        if (ws == null) return;
+
+        String uuid = player.getUniqueId().toString().replace("-", "");
+        String name = player.getName().replace("\"", "\\\"");
+
+        final String payload = "{\"op\":\"mc_perm_query\",\"uuid\":\"" + uuid + "\","
+                + "\"name\":\"" + name + "\"}";
+
+        try {
+            ws.sendText(payload, true);
+        } catch (Exception ignored) {
+        }
     }
 
     private String generateToken() {
@@ -361,6 +472,86 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private void loadModerationData() {
+        bans.clear();
+        mutes.clear();
+
+        if (!moderationFile.exists()) {
+            return;
+        }
+
+        moderationConfig = YamlConfiguration.loadConfiguration(moderationFile);
+
+        ConfigurationSection bansSec = moderationConfig.getConfigurationSection("bans");
+        if (bansSec != null) {
+            for (String uuid : bansSec.getKeys(false)) {
+                String path = "bans." + uuid + ".";
+                String name = bansSec.getString(uuid + ".name", "Unknown");
+                long createdAt = bansSec.getLong(uuid + ".createdAt", 0L);
+                long expiresAt = bansSec.getLong(uuid + ".expiresAt", 0L);
+                String reason = bansSec.getString(uuid + ".reason", "You are banned from this server.");
+                String source = bansSec.getString(uuid + ".source", "System");
+
+                BanEntry entry = new BanEntry(uuid, name, createdAt, expiresAt, reason, source);
+                if (entry.isActive()) {
+                    bans.put(uuid, entry);
+                }
+            }
+        }
+
+        ConfigurationSection mutesSec = moderationConfig.getConfigurationSection("mutes");
+        if (mutesSec != null) {
+            for (String uuid : mutesSec.getKeys(false)) {
+                String path = "mutes." + uuid + ".";
+                String name = mutesSec.getString(uuid + ".name", "Unknown");
+                long createdAt = mutesSec.getLong(uuid + ".createdAt", 0L);
+                long expiresAt = mutesSec.getLong(uuid + ".expiresAt", 0L);
+                String reason = mutesSec.getString(uuid + ".reason", "You are muted on this server.");
+                String source = mutesSec.getString(uuid + ".source", "System");
+
+                MuteEntry entry = new MuteEntry(uuid, name, createdAt, expiresAt, reason, source);
+                if (entry.isActive()) {
+                    mutes.put(uuid, entry);
+                }
+            }
+        }
+
+        getLogger().info("Loaded " + bans.size() + " active bans and " + mutes.size() + " active mutes.");
+    }
+
+    private void saveModerationData() {
+        if (moderationConfig == null) {
+            moderationConfig = new YamlConfiguration();
+        }
+
+        moderationConfig.set("bans", null);
+        moderationConfig.set("mutes", null);
+
+        for (BanEntry b : bans.values()) {
+            String base = "bans." + b.uuid + ".";
+            moderationConfig.set(base + "name", b.name);
+            moderationConfig.set(base + "createdAt", b.createdAt);
+            moderationConfig.set(base + "expiresAt", b.expiresAt);
+            moderationConfig.set(base + "reason", b.reason);
+            moderationConfig.set(base + "source", b.source);
+        }
+
+        for (MuteEntry m : mutes.values()) {
+            String base = "mutes." + m.uuid + ".";
+            moderationConfig.set(base + "name", m.name);
+            moderationConfig.set(base + "createdAt", m.createdAt);
+            moderationConfig.set(base + "expiresAt", m.expiresAt);
+            moderationConfig.set(base + "reason", m.reason);
+            moderationConfig.set(base + "source", m.source);
+        }
+
+        try {
+            moderationConfig.save(moderationFile);
+        } catch (Exception e) {
+            getLogger().severe("Failed to save moderation.yml: " + e);
+        }
+    }
+
     // ---------- WebSocket connection / retry ----------
 
     private void connectWithRetry() {
@@ -490,8 +681,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 final String finalMsg =
                     colorCode
                     + prefixPart
-                    + user
-                    + "§r§7@" + guild + ": "
+                    + "§l" + user
+                    + "§r§7@" + guild + "§r"  + ": "
                     + text;
 
                 Bukkit.getScheduler().runTask(this,
@@ -507,11 +698,307 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 handleDcAdmin(obj);
                 break;
             }
+	    case "mc_permset": {
+                String uuid = obj.has("uuid") && !obj.get("uuid").isJsonNull()
+                        ? obj.get("uuid").getAsString()
+                        : null;
+                String prefix = obj.has("prefix") && !obj.get("prefix").isJsonNull()
+                        ? obj.get("prefix").getAsString()
+                        : null;
+                String colorHex = obj.has("color") && !obj.get("color").isJsonNull()
+                        ? obj.get("color").getAsString()
+                        : null;
+
+                boolean canKick = obj.has("can_kick") && !obj.get("can_kick").isJsonNull()
+                        && obj.get("can_kick").getAsInt() != 0;
+                boolean canBan = obj.has("can_ban") && !obj.get("can_ban").isJsonNull()
+                        && obj.get("can_ban").getAsInt() != 0;
+                boolean canTimeout = obj.has("can_timeout") && !obj.get("can_timeout").isJsonNull()
+                        && obj.get("can_timeout").getAsInt() != 0;
+                boolean isStaff = obj.has("is_staff") && !obj.get("is_staff").isJsonNull()
+                        && obj.get("is_staff").getAsInt() != 0;
+
+                if (uuid != null && !uuid.isEmpty()) {
+                    playerStyles.put(uuid, new PlayerStyle(prefix, colorHex,
+                            canKick, canBan, canTimeout, isStaff));
+                    getLogger().info("Updated style for uuid=" + uuid
+                            + " prefix=" + prefix + " color=" + colorHex
+                            + " perms: kick=" + canKick + " ban=" + canBan + " timeout=" + canTimeout);
+                } else {
+                    getLogger().info("mc_permset without uuid, ignoring");
+                }
+                break;
+            }
+	    case "dc_notify": {
+                String mcName = obj.has("mc_name") && !obj.get("mc_name").isJsonNull()
+                        ? obj.get("mc_name").getAsString()
+                        : "";
+                if (mcName != null && !mcName.isEmpty()) {
+                    notifyPing(mcName);
+                }
+                break;
+            } 
 	    default: {
                 getLogger().info("WS unknown op: " + op);
                 break;
             }
         }
+    }
+
+    private boolean handleLinkdiscord(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("Only players can use this.");
+            return true;
+        }
+
+        if (!sender.hasPermission("kavexlink.link")) {
+            sender.sendMessage("You don't have permission to link your account.");
+            return true;
+        }
+
+        WebSocket ws = socketRef.get();
+        if (ws == null) {
+            sender.sendMessage("The Discord bridge is currently offline. Try again later.");
+            return true;
+        }
+
+        String code = generateLinkCode();
+        String uuid = p.getUniqueId().toString().replace("-", "");
+        String name = p.getName();
+
+        // Send link request over WS
+        String payload = "{\"op\":\"mc_link_request\","
+                + "\"uuid\":\"" + uuid + "\","
+                + "\"name\":\"" + escape(name) + "\","
+                + "\"code\":\"" + code + "\"}";
+
+        try {
+            ws.sendText(payload, true);
+        } catch (Exception e) {
+            getLogger().warning("Failed to send mc_link_request: " + e);
+            sender.sendMessage("Failed to contact the Discord bridge. Try again later.");
+            return true;
+        }
+
+        sender.sendMessage("§aYour link code is §e" + code + "§a.");
+        sender.sendMessage("§7Open the Discord server and run §b/linkdiscord " + code + "§7.");
+        return true;
+    }
+   
+    private PlayerStyle requireStyleWithMessage(Player player, boolean checkKick, boolean checkBan, boolean checkTimeout) {
+        String uuid = player.getUniqueId().toString().replace("-", "");
+        PlayerStyle style = playerStyles.get(uuid);
+        if (style == null) {
+            player.sendMessage("§cYour Discord account is not linked or permissions have not been synced yet.");
+            return null;
+        }
+
+        if (checkKick && !style.canKick) {
+            player.sendMessage("§cYou are not allowed to kick players (Discord Kick Members required).");
+            return null;
+        }
+        if (checkBan && !style.canBan) {
+            player.sendMessage("§cYou are not allowed to ban players (Discord Ban Members required).");
+            return null;
+        }
+        if (checkTimeout && !style.canTimeout) {
+            player.sendMessage("§cYou are not allowed to mute players (Discord Timeout/Moderate Members required).");
+            return null;
+        }
+        return style;
+    }
+
+    private boolean handleKavexKick(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 1) {
+            player.sendMessage("Usage: /kavexkick <player> [reason]");
+            return true;
+        }
+
+        PlayerStyle style = requireStyleWithMessage(player, true, false, false);
+        if (style == null) return true;
+
+        String targetName = args[0];
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target == null) {
+            player.sendMessage("§cPlayer not found: " + targetName);
+            return true;
+        }
+
+        String reason = (args.length > 1)
+                ? String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length))
+                : "Kicked by " + player.getName();
+
+        target.kick(Component.text("You were kicked: " + reason, NamedTextColor.RED));
+        Bukkit.broadcastMessage("§c" + target.getName() + " was kicked by " + player.getName() + ".");
+	sendModEvent("kick", target.getName(), player.getName(), reason, 0);
+	return true;
+    }
+
+    private boolean handleKavexBan(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 1) {
+            player.sendMessage("Usage: /kavexban <player> [reason]");
+            return true;
+        }
+
+        PlayerStyle style = requireStyleWithMessage(player, false, true, false);
+        if (style == null) return true;
+
+        String targetName = args[0];
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target == null) {
+            player.sendMessage("§cPlayer not found: " + targetName);
+            return true;
+        }
+
+        String uuid = target.getUniqueId().toString().replace("-", "");
+        String reason = (args.length > 1)
+                ? String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length))
+                : "Banned by " + player.getName();
+
+        long now = System.currentTimeMillis();
+        BanEntry entry = new BanEntry(
+                uuid,
+                target.getName(),
+                now,
+                0L, // permanent
+                reason,
+                player.getName()
+        );
+        bans.put(uuid, entry);
+        saveModerationData();
+
+        target.kick(Component.text("You are banned: " + reason, NamedTextColor.RED));
+        Bukkit.broadcastMessage("§c" + target.getName() + " was banned by " + player.getName() + ".");
+	sendModEvent("ban", target.getName(), player.getName(), reason, 0);
+	return true;
+    }
+
+    private boolean handleKavexTempBan(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 2) {
+            player.sendMessage("Usage: /kavextempban <player> <minutes> [reason]");
+            return true;
+        }
+
+        PlayerStyle style = requireStyleWithMessage(player, false, true, false);
+        if (style == null) return true;
+
+        String targetName = args[0];
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target == null) {
+            player.sendMessage("§cPlayer not found: " + targetName);
+            return true;
+        }
+
+        int minutes;
+        try {
+            minutes = Integer.parseInt(args[1]);
+        } catch (NumberFormatException ex) {
+            player.sendMessage("§cInvalid minutes: " + args[1]);
+            return true;
+        }
+        if (minutes <= 0) {
+            player.sendMessage("§cMinutes must be > 0.");
+            return true;
+        }
+
+        String reason = (args.length > 2)
+                ? String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length))
+                : "Temporarily banned by " + player.getName();
+
+        long now = System.currentTimeMillis();
+        long expiresAt = now + minutes * 60_000L;
+
+        String uuid = target.getUniqueId().toString().replace("-", "");
+        BanEntry entry = new BanEntry(
+                uuid,
+                target.getName(),
+                now,
+                expiresAt,
+                reason,
+                player.getName()
+        );
+        bans.put(uuid, entry);
+        saveModerationData();
+
+        target.kick(Component.text(
+            "You are temporarily banned for " + minutes + " minute(s): " + reason,
+                NamedTextColor.RED
+        ));
+        Bukkit.broadcastMessage("§c" + target.getName() + " was tempbanned for " + minutes
+            + " minute(s) by " + player.getName() + ".");
+	sendModEvent("tempban", target.getName(), player.getName(), reason, minutes);
+	return true;
+    }
+
+    private boolean handleKavexMute(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 2) {
+            player.sendMessage("Usage: /kavexmute <player> <minutes> [reason]");
+            return true;
+        }
+
+        PlayerStyle style = requireStyleWithMessage(player, false, false, true);
+        if (style == null) return true;
+
+        String targetName = args[0];
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target == null) {
+            player.sendMessage("§cPlayer not found: " + targetName);
+            return true;
+        }
+
+        int minutes;
+        try {
+            minutes = Integer.parseInt(args[1]);
+        } catch (NumberFormatException ex) {
+            player.sendMessage("§cInvalid minutes: " + args[1]);
+            return true;
+        }
+        if (minutes <= 0) {
+            player.sendMessage("§cMinutes must be > 0.");
+            return true;
+        }
+
+        String reason = (args.length > 2)
+                ? String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length))
+                : "Muted by " + player.getName();
+
+        long now = System.currentTimeMillis();
+        long expiresAt = now + minutes * 60_000L;
+
+        String uuid = target.getUniqueId().toString().replace("-", "");
+        MuteEntry entry = new MuteEntry(
+                uuid,
+                target.getName(),
+                now,
+                expiresAt,
+                reason,
+                player.getName()
+        );
+        mutes.put(uuid, entry);
+        saveModerationData();
+
+        target.sendMessage(org.bukkit.ChatColor.RED + "You are muted for " + minutes
+                + " minute(s): " + reason);
+        Bukkit.broadcastMessage("§e" + target.getName() + " was muted for " + minutes
+                + " minute(s) by " + player.getName() + ".");
+	sendModEvent("mute", target.getName(), player.getName(), reason, minutes);
+        return true;
     }
 
     // ---- Events → Discord (mc_event) ----
@@ -520,6 +1007,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
     public void onPlayerJoin(PlayerJoinEvent e) {
         Player p = e.getPlayer();
         sendEvent("join", p, "connected");
+        requestPermStyle(p);
     }
 
     @EventHandler
@@ -560,13 +1048,186 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private void sendModEvent(String action,
+                              String targetName,
+                              String issuedBy,
+                              String reason,
+                              int minutes) {
+        WebSocket ws = socketRef.get();
+        if (ws == null) return;
+
+        String safeTarget = escape(targetName != null ? targetName : "");
+        String safeIssued = escape(issuedBy != null ? issuedBy : "System");
+        String safeReason = escape(reason != null ? reason : "");
+
+        String payload = "{\"op\":\"mc_mod\","
+                + "\"action\":\"" + action + "\","
+                + "\"target\":\"" + safeTarget + "\","
+                + "\"issued_by\":\"" + safeIssued + "\","
+                + "\"reason\":\"" + safeReason + "\","
+                + "\"minutes\":" + minutes + "}";
+
+        try {
+            ws.sendText(payload, true);
+        } catch (Exception e) {
+            getLogger().warning("Failed to send mc_mod event: " + e);
+        }
+    }
+
+    private void notifyPing(String mcName) {
+        org.bukkit.entity.Player target = Bukkit.getPlayerExact(mcName);
+        if (target == null || !target.isOnline()) {
+            return;
+        }
+
+        // play two note-block chimes as a "ping"
+        // 1st now
+        target.playSound(
+                target.getLocation(),
+                org.bukkit.Sound.BLOCK_NOTE_BLOCK_PLING,
+                1.0f,
+                1.0f
+        );
+        // 2nd a short time later (3 ticks ≈ 0.15s)
+        Bukkit.getScheduler().runTaskLater(
+                this,
+                () -> target.playSound(
+                        target.getLocation(),
+                        org.bukkit.Sound.BLOCK_NOTE_BLOCK_PLING,
+                        1.0f,
+                        1.5f
+                ),
+                3L
+        );
+    }
+
+    private boolean handleKavexPardon(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 1) {
+            player.sendMessage("Usage: /kavexpardon <player> [reason]");
+            return true;
+        }
+
+        // Requires Discord Ban perms (same as /kavexban)
+        PlayerStyle style = requireStyleWithMessage(player, false, true, false);
+        if (style == null) return true;
+
+        String targetName = args[0];
+
+        // Try by online player, then by stored name
+        String banUuid = null;
+        BanEntry entry = null;
+
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target != null) {
+            banUuid = target.getUniqueId().toString().replace("-", "");
+            entry = bans.get(banUuid);
+        }
+
+        if (entry == null) {
+            for (BanEntry b : bans.values()) {
+                if (b.name.equalsIgnoreCase(targetName)) {
+                    entry = b;
+                    banUuid = b.uuid;
+                    break;
+                }
+            }
+        }
+
+        if (entry == null) {
+            player.sendMessage("§cNo active ban found for " + targetName + ".");
+            return true;
+        }
+
+        String reason = (args.length > 1)
+                ? String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length))
+                : "Unbanned by " + player.getName();
+
+        bans.remove(banUuid);
+        saveModerationData();
+
+        Bukkit.broadcastMessage("§a" + entry.name + " was unbanned by " + player.getName() + ".");
+        sendModEvent("pardon", entry.name, player.getName(), reason, 0);
+        return true;
+    }
+
+    private boolean handleKavexUnmute(org.bukkit.command.CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 1) {
+            player.sendMessage("Usage: /kavexunmute <player> [reason]");
+            return true;
+        }
+
+        // Requires Discord timeout/mod perms (same as /kavexmute)
+        PlayerStyle style = requireStyleWithMessage(player, false, false, true);
+        if (style == null) return true;
+
+        String targetName = args[0];
+
+        String muteUuid = null;
+        MuteEntry entry = null;
+
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target != null) {
+            muteUuid = target.getUniqueId().toString().replace("-", "");
+            entry = mutes.get(muteUuid);
+        }
+
+        if (entry == null) {
+            for (MuteEntry m : mutes.values()) {
+                if (m.name.equalsIgnoreCase(targetName)) {
+                    entry = m;
+                    muteUuid = m.uuid;
+                    break;
+                }
+            }
+        }
+
+        if (entry == null) {
+            player.sendMessage("§cNo active mute found for " + targetName + ".");
+            return true;
+        }
+
+        String reason = (args.length > 1)
+                ? String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length))
+                : "Unmuted by " + player.getName();
+
+        mutes.remove(muteUuid);
+        saveModerationData();
+
+        if (target != null) {
+            target.sendMessage("§aYou have been unmuted by " + player.getName() + ".");
+        }
+        Bukkit.broadcastMessage("§a" + entry.name + " was unmuted by " + player.getName() + ".");
+        sendModEvent("unmute", entry.name, player.getName(), reason, 0);
+        return true;
+    }
+
+
+    @EventHandler
+    public void onPreLogin(AsyncPlayerPreLoginEvent e) {
+        String uuid = e.getUniqueId().toString().replace("-", "");
+        BanEntry ban = bans.get(uuid);
+        if (ban != null && ban.isActive()) {
+            String msg = org.bukkit.ChatColor.RED + "You are banned from this server.\n"
+                    + org.bukkit.ChatColor.GRAY + "Reason: " + ban.reason;
+            e.disallow(Result.KICK_BANNED, msg);
+        }
+    }
+
     // ---- Admin commands ----
-    
+
     private void handleDcAdmin(JsonObject obj) {
         String action = obj.has("action") && !obj.get("action").isJsonNull()
                 ? obj.get("action").getAsString().toLowerCase()
                 : "";
-        String player = obj.has("player") && !obj.get("player").isJsonNull()
+        String playerName = obj.has("player") && !obj.get("player").isJsonNull()
                 ? obj.get("player").getAsString()
                 : "";
         String reason = obj.has("reason") && !obj.get("reason").isJsonNull()
@@ -575,51 +1236,186 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         String issuedBy = obj.has("issued_by") && !obj.get("issued_by").isJsonNull()
                 ? obj.get("issued_by").getAsString()
                 : "Discord";
+        int minutes = obj.has("minutes") && !obj.get("minutes").isJsonNull()
+                ? obj.get("minutes").getAsInt()
+                : 0;
+        String consoleCmd = obj.has("console") && !obj.get("console").isJsonNull()
+                ? obj.get("console").getAsString()
+                : null;
 
-        if (player.isEmpty()) {
+        if (playerName.isEmpty() && !"command".equals(action)) {
             getLogger().warning("dc_admin: empty player in payload: " + obj);
             return;
         }
 
-        // Log on the MC side
-        getLogger().info("dc_admin: action=" + action + " player=" + player
-                + " reason=" + reason + " issued_by=" + issuedBy);
+        getLogger().info("dc_admin: action=" + action + " player=" + playerName
+                + " reason=" + reason + " issued_by=" + issuedBy + " minutes=" + minutes);
 
-        // Run on main thread
         Bukkit.getScheduler().runTask(this, () -> {
+            Player target = (playerName.isEmpty() ? null : Bukkit.getPlayerExact(playerName));
+
             switch (action) {
                 case "kick": {
-                    String msg = "Kicked by " + issuedBy;
-                    if (!reason.isEmpty()) msg += " (" + reason + ")";
-                    Bukkit.dispatchCommand(
-                            Bukkit.getConsoleSender(),
-                            "kick " + player + " " + msg
-                    );
+                    if (target == null) {
+                        getLogger().info("dc_admin kick: player not online: " + playerName);
+                        return;
+                    }
+                    String msg = reason.isEmpty()
+                            ? "Kicked by " + issuedBy
+                            : reason;
+                    target.kick(Component.text("You were kicked: " + msg, NamedTextColor.RED));
+                    Bukkit.broadcastMessage("§c" + target.getName() + " was kicked by " + issuedBy + ".");
+                    sendModEvent("kick", target.getName(), issuedBy, msg, 0);
                     break;
                 }
                 case "ban": {
-                    String msg = "Banned by " + issuedBy;
-                    if (!reason.isEmpty()) msg += " (" + reason + ")";
-                    Bukkit.dispatchCommand(
-                            Bukkit.getConsoleSender(),
-                            "ban " + player + " " + msg
+                    if (target == null) {
+                        getLogger().info("dc_admin ban: player not online: " + playerName);
+                        return;
+                    }
+                    String uuid = target.getUniqueId().toString().replace("-", "");
+                    long now = System.currentTimeMillis();
+                    String banReason = reason.isEmpty()
+                            ? "Banned by " + issuedBy
+                            : reason;
+                    BanEntry entry = new BanEntry(
+                            uuid,
+                            target.getName(),
+                            now,
+                            0L,
+                            banReason,
+                            issuedBy
                     );
+                    bans.put(uuid, entry);
+                    saveModerationData();
+
+                    target.kick(Component.text("You are banned: " + banReason, NamedTextColor.RED));
+                    Bukkit.broadcastMessage("§c" + target.getName() + " was banned by " + issuedBy + ".");
+                    sendModEvent("ban", target.getName(), issuedBy, banReason, 0);
                     break;
                 }
-                // easy to extend:
-                case "pardon": {
-                    Bukkit.dispatchCommand(
-                            Bukkit.getConsoleSender(),
-                            "pardon " + player
+                case "tempban": {
+                    if (target == null) {
+                        getLogger().info("dc_admin tempban: player not online: " + playerName);
+                        return;
+                    }
+                    // minutes is effectively final; derive a local effectiveMinutes
+                    int effectiveMinutes = (minutes <= 0) ? 1 : minutes;
+
+                    String uuid = target.getUniqueId().toString().replace("-", "");
+                    long now = System.currentTimeMillis();
+                    long expiresAt = now + effectiveMinutes * 60_000L;
+
+                    String banReason = reason.isEmpty()
+                            ? "Temporarily banned by " + issuedBy
+                            : reason;
+
+                    BanEntry entry = new BanEntry(
+                            uuid,
+                            target.getName(),
+                            now,
+                            expiresAt,
+                            banReason,
+                            issuedBy
                     );
+                    bans.put(uuid, entry);
+                    saveModerationData();
+
+                    target.kick(Component.text(
+                            "You are temporarily banned for " + effectiveMinutes + " minute(s): " + banReason,
+                            NamedTextColor.RED
+                    ));
+                    Bukkit.broadcastMessage("§c" + target.getName() + " was tempbanned for "
+                            + effectiveMinutes + " minute(s) by " + issuedBy + ".");
+                    sendModEvent("tempban", target.getName(), issuedBy, banReason, effectiveMinutes);
+                    break;
+                }
+                case "mute": {
+                    if (target == null) {
+                        getLogger().info("dc_admin mute: player not online: " + playerName);
+                        return;
+                    }
+                    int effectiveMinutes = (minutes <= 0) ? 1 : minutes;
+
+                    String uuid = target.getUniqueId().toString().replace("-", "");
+                    long now = System.currentTimeMillis();
+                    long expiresAt = now + effectiveMinutes * 60_000L;
+                    String muteReason = reason.isEmpty()
+                            ? "Muted by " + issuedBy
+                            : reason;
+
+                    MuteEntry entry = new MuteEntry(
+                            uuid,
+                            target.getName(),
+                            now,
+                            expiresAt,
+                            muteReason,
+                            issuedBy
+                    );
+                    mutes.put(uuid, entry);
+                    saveModerationData();
+
+                    target.sendMessage(org.bukkit.ChatColor.RED + "You are muted for "
+                            + effectiveMinutes + " minute(s): " + muteReason);
+                    Bukkit.broadcastMessage("§e" + target.getName() + " was muted for "
+                            + effectiveMinutes + " minute(s) by " + issuedBy + ".");
+                    sendModEvent("mute", target.getName(), issuedBy, muteReason, effectiveMinutes);
+                    break;
+                }
+                case "pardon": {
+                    String banUuid = null;
+                    BanEntry entry = null;
+                    for (BanEntry b : bans.values()) {
+                        if (b.name.equalsIgnoreCase(playerName)) {
+                            entry = b;
+                            banUuid = b.uuid;
+                            break;
+                        }
+                    }
+                    if (entry == null) {
+                        getLogger().info("dc_admin pardon: no active ban for " + playerName);
+                        return;
+                    }
+                    String r = reason.isEmpty()
+                            ? "Unbanned by " + issuedBy
+                            : reason;
+                    bans.remove(banUuid);
+                    saveModerationData();
+                    Bukkit.broadcastMessage("§a" + entry.name + " was unbanned by " + issuedBy + ".");
+                    sendModEvent("pardon", entry.name, issuedBy, r, 0);
+                    break;
+                }
+                case "unmute": {
+                    String muteUuid = null;
+                    MuteEntry entry = null;
+                    for (MuteEntry m : mutes.values()) {
+                        if (m.name.equalsIgnoreCase(playerName)) {
+                            entry = m;
+                            muteUuid = m.uuid;
+                            break;
+                        }
+                    }
+                    if (entry == null) {
+                        getLogger().info("dc_admin unmute: no active mute for " + playerName);
+                        return;
+                    }
+                    String r = reason.isEmpty()
+                            ? "Unmuted by " + issuedBy
+                            : reason;
+                    mutes.remove(muteUuid);
+                    saveModerationData();
+
+                    if (target != null) {
+                        target.sendMessage("§aYou have been unmuted by " + issuedBy + ".");
+                    }
+                    Bukkit.broadcastMessage("§a" + entry.name + " was unmuted by " + issuedBy + ".");
+                    sendModEvent("unmute", entry.name, issuedBy, r, 0);
                     break;
                 }
                 case "command": {
-                    // OPTIONAL: allow arbitrary console commands from Discord
-                    if (obj.has("console") && !obj.get("console").isJsonNull()) {
-                        String cmd = obj.get("console").getAsString();
-                        getLogger().info("dc_admin console command from " + issuedBy + ": " + cmd);
-                        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+                    if (consoleCmd != null && !consoleCmd.isEmpty()) {
+                        getLogger().info("dc_admin console command from " + issuedBy + ": " + consoleCmd);
+                        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), consoleCmd);
                     }
                     break;
                 }
@@ -631,7 +1427,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         });
     }
 
-        private String generateLinkCode() {
+    private String generateLinkCode() {
         // Simple 8-char alphanumeric code
         String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         SecureRandom rnd = new SecureRandom();
@@ -643,73 +1439,93 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
     }
 
     @Override
-    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
-        if (!cmd.getName().equalsIgnoreCase("linkdiscord")) {
-            return false;
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        String name = command.getName().toLowerCase();
+        switch (name) {
+            case "linkdiscord":
+                return handleLinkdiscord(sender, args);
+            case "kavexkick":
+                return handleKavexKick(sender, args);
+            case "kavexban":
+                return handleKavexBan(sender, args);
+            case "kavextempban":
+                return handleKavexTempBan(sender, args);
+            case "kavexmute":
+                return handleKavexMute(sender, args);
+            case "kavexpardon":
+                return handleKavexPardon(sender, args);
+            case "kavexunmute":
+                return handleKavexUnmute(sender, args);
+	    default:
+                return false;
         }
-
-        if (!(sender instanceof Player p)) {
-            sender.sendMessage("Only players can use this.");
-            return true;
-        }
-
-        if (!sender.hasPermission("kavexlink.link")) {
-            sender.sendMessage("You don't have permission to link your account.");
-            return true;
-        }
-
-        WebSocket ws = socketRef.get();
-        if (ws == null) {
-            sender.sendMessage("The Discord bridge is currently offline. Try again later.");
-            return true;
-        }
-
-        String code = generateLinkCode();
-        String uuid = p.getUniqueId().toString().replace("-", "");
-        String name = p.getName();
-
-        // Send link request over WS
-        String payload = "{\"op\":\"mc_link_request\","
-                + "\"uuid\":\"" + uuid + "\","
-                + "\"name\":\"" + escape(name) + "\","
-                + "\"code\":\"" + code + "\"}";
-
-        try {
-            ws.sendText(payload, true);
-        } catch (Exception e) {
-            getLogger().warning("Failed to send mc_link_request: " + e);
-            sender.sendMessage("Failed to contact the Discord bridge. Try again later.");
-            return true;
-        }
-
-        sender.sendMessage("§aYour link code is §e" + code + "§a.");
-        sender.sendMessage("§7Open the Discord server and run §b/linkdiscord " + code + "§7.");
-
-        return true;
     }
-
 
 
     // ---- Chat capture to Discord ----
 
-    @EventHandler
+        @EventHandler
     public void onChat(AsyncChatEvent e) {
         WebSocket ws = socketRef.get();
-        if (ws == null) return;
 
-        final String player = e.getPlayer().getName();
-        final String uuid = e.getPlayer().getUniqueId().toString().replace("-", "");
-        final String text = PlainTextComponentSerializer.plainText()
-                .serialize(e.message())
-                .replace("\"", "\\\"");
+        final Player player = e.getPlayer();
+        final String playerName = player.getName();
+        final String uuid = player.getUniqueId().toString().replace("-", "");
 
-        final String payload = "{\"op\":\"mc_chat\",\"player\":\"" + player + "\","
-                + "\"uuid\":\"" + uuid + "\","
-                + "\"text\":\"" + text + "\"}";
-        try {
-            ws.sendText(payload, true);
-        } catch (Exception ignored) {
+        // Text as seen in Minecraft chat
+        final String rawText = PlainTextComponentSerializer.plainText()
+                .serialize(e.message());
+
+        // Text escaped for JSON payload to Discord
+        final String text = rawText.replace("\"", "\\\"");
+
+        // Check for active mute
+        MuteEntry mute = mutes.get(uuid);
+        if (mute != null && mute.isActive()) {
+            e.setCancelled(true);
+
+            long remainingMs = (mute.expiresAt == 0L)
+                    ? -1L
+                    : (mute.expiresAt - System.currentTimeMillis());
+            String remainingStr;
+            if (remainingMs < 0L) {
+                remainingStr = "permanently";
+            } else {
+                long minutes = Math.max(1L, remainingMs / 60000L);
+                remainingStr = "for about " + minutes + " minute(s)";
+            }
+
+            Bukkit.getScheduler().runTask(this, () -> {
+                player.sendMessage(org.bukkit.ChatColor.RED + "You are muted "
+                        + remainingStr + ". Reason: " + mute.reason);
+            });
+            return;
         }
+
+        // Send to Discord as before
+        if (ws != null) {
+            final String payload = "{\"op\":\"mc_chat\",\"player\":\"" + playerName + "\","
+                    + "\"uuid\":\"" + uuid + "\","
+                    + "\"text\":\"" + text + "\"}";
+            try {
+                ws.sendText(payload, true);
+            } catch (Exception ignored) {
+            }
+        }
+
+        // Look up style for this player
+        PlayerStyle style = playerStyles.get(uuid);
+        String prefix = (style != null && style.prefix != null && !style.prefix.isEmpty())
+                ? style.prefix + " "
+                : "";
+        String colorCode = (style != null) ? hexToMinecraftColor(style.colorHex) : "§f";
+
+        final String finalMsg = colorCode + prefix + "§l" + playerName + "§r: " + rawText;
+
+        // Override default chat formatting
+        e.setCancelled(true);
+        Bukkit.getScheduler().runTask(this,
+                () -> Bukkit.broadcastMessage(finalMsg));
     }
 
     private static String escape(String s) {

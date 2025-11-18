@@ -11,3 +11,26 @@ commands:
     usage: "/linkdiscord"
     permission: kavexlink.link
 
+  kavexkick:
+    description: Kick a player using Discord-based permissions
+    usage: /kavexkick <player> [reason]
+    permission: kavexlink.mod
+    permission-message: You are not allowed to use this command.
+
+  kavexban:
+    description: Ban a player using Discord-based permissions
+    usage: /kavexban <player> [reason]
+    permission: kavexlink.mod
+    permission-message: You are not allowed to use this command.
+
+  kavextempban:
+    description: Temporarily ban a player using Discord-based permissions
+    usage: /kavextempban <player> <minutes> [reason]
+    permission: kavexlink.mod
+    permission-message: You are not allowed to use this command.
+
+  kavexmute:
+    description: Mute (timeout) a player using Discord-based permissions
+    usage: /kavexmute <player> <minutes> [reason]
+    permission: kavexlink.mod
+    permission-message: You are not allowed to use this command.
