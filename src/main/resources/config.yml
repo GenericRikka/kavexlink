@@ -19,3 +19,7 @@ ssl:
   # Optional: override SNI/hostname used for verification.
   # If omitted, Java uses the host from the ws-url.
   hostname: "bot.kavocado.net"
+
+direct_messages:
+  retention_days: 30
+

@@ -34,3 +34,15 @@ commands:
     usage: /kavexmute <player> <minutes> [reason]
     permission: kavexlink.mod
     permission-message: You are not allowed to use this command.
+
+  friendrequest:
+    description: Send or view friend requests
+    usage: /friendrequest <player>|view
+
+  friend:
+    description: Accept or deny friend requests
+    usage: /friend accept <player> | /friend deny <player>
+
+  friends:
+    description: Open the friends GUI
+    usage: /friends

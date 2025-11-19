@@ -28,6 +28,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,7 +78,9 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private final Map<String, PlayerStyle> playerStyles = new ConcurrentHashMap<>();
-    
+
+    private FriendManager friendManager;
+
     private static class PlayerStyle {
         final String prefix;
         final String colorHex;
@@ -162,6 +165,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         this.dataDir = getDataFolder().toPath();
         this.secretFile = dataDir.resolve("secret.txt");
 
+	new FriendCompassTask(this).runTaskTimer(this, 20L, 20L);
+
         String motd = Bukkit.getServer().getMotd();
         this.serverName = getConfig().getString("server-name",
                 (motd != null && !motd.isEmpty()) ? motd : "Minecraft");
@@ -227,13 +232,27 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         // Build HttpClient – SIMPLE VERSION (no custom SSLContext/pinning)
         this.http = buildHttpClientWithSsl();
 
-        Bukkit.getPluginManager().registerEvents(this, this);
         connectWithRetry();
+        this.friendManager = new FriendManager(this);
+
+        getCommand("friendrequest").setExecutor(new FriendRequestCommand(this));
+        getCommand("friend").setExecutor(new FriendCommand(this));
+        getCommand("friends").setExecutor(new FriendsGuiCommand(this));
+
+        getServer().getPluginManager().registerEvents(this, this);
+        getServer().getPluginManager().registerEvents(new FriendsListener(this), this);
+    }
+
+    public FriendManager getFriendManager() {
+        return friendManager;
     }
 
     @Override
     public void onDisable() {
 	saveModerationData();
+	if (friendManager != null) {
+            friendManager.saveToDisk();
+        }
         running.set(false);
         WebSocket ws = socketRef.getAndSet(null);
         if (ws != null) ws.abort();
@@ -1008,13 +1027,37 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         Player p = e.getPlayer();
         sendEvent("join", p, "connected");
         requestPermStyle(p);
+
+        UUID uuid = p.getUniqueId();
+        for (String msg : friendManager.drainNotifications(uuid)) {
+            p.sendMessage(msg);
+        }
+
+        // Notify their friends
+        Set<UUID> friends = friendManager.getFriends(uuid);
+        for (UUID friendId : friends) {
+            Player friend = Bukkit.getPlayer(friendId);
+            if (friend != null && friend.isOnline()) {
+                friend.sendMessage("§aYour friend §e" + p.getName() + " §ahas joined the game.");
+            }
+        }
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent e) {
         Player p = e.getPlayer();
         sendEvent("quit", p, "disconnected");
+
+        UUID uuid = p.getUniqueId();
+        Set<UUID> friends = friendManager.getFriends(uuid);
+        for (UUID friendId : friends) {
+            Player friend = Bukkit.getPlayer(friendId);
+            if (friend != null && friend.isOnline()) {
+                friend.sendMessage("§cYour friend §e" + p.getName() + " §chas left the game.");
+            }
+        }
     }
+
 
     @EventHandler
     public void onPlayerDeath(PlayerDeathEvent e) {
@@ -1464,7 +1507,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
 
     // ---- Chat capture to Discord ----
 
-        @EventHandler
+    @EventHandler
     public void onChat(AsyncChatEvent e) {
         WebSocket ws = socketRef.get();
 
@@ -1472,12 +1515,15 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         final String playerName = player.getName();
         final String uuid = player.getUniqueId().toString().replace("-", "");
 
-        // Text as seen in Minecraft chat
+        // Raw plain text as the player typed it (e.message() is an Adventure Component)
         final String rawText = PlainTextComponentSerializer.plainText()
                 .serialize(e.message());
 
+        // ---- NEW: convert MC formatting -> Discord markdown (drop colors) ----
+        final String discordFormatted = MarkdownUtil.minecraftToDiscord(rawText);
+
         // Text escaped for JSON payload to Discord
-        final String text = rawText.replace("\"", "\\\"");
+        final String text = escape(discordFormatted);
 
         // Check for active mute
         MuteEntry mute = mutes.get(uuid);
@@ -1502,7 +1548,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        // Send to Discord as before
+        // Send to Discord (now using markdown-formatted text)
         if (ws != null) {
             final String payload = "{\"op\":\"mc_chat\",\"player\":\"" + playerName + "\","
                     + "\"uuid\":\"" + uuid + "\","
@@ -1520,7 +1566,12 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 : "";
         String colorCode = (style != null) ? hexToMinecraftColor(style.colorHex) : "§f";
 
-        final String finalMsg = colorCode + prefix + "§l" + playerName + "§r: " + rawText;
+        // ---- NEW: apply &-codes inside the message for in-game display ----
+        // Example: "&l&2Test&r Lol" becomes colored/bold in MC
+        final String coloredMessage =
+            MinecraftFormatUtil.applyPersistentFormatting(rawText);
+
+        final String finalMsg = colorCode + prefix + "§l" + playerName + "§r: " + coloredMessage;
 
         // Override default chat formatting
         e.setCancelled(true);

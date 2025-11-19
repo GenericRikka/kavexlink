@@ -21,14 +21,13 @@ java {
 }
 
 tasks.processResources {
-    // expand version into plugin.yml if you want
+    // expand version into plugin.yml if desired
     filesMatching("plugin.yml") {
         expand("version" to project.version)
     }
 }
 
 tasks.jar {
-    // No shading needed; we depend only on Paper API
     archiveBaseName.set("KavexLink")
 }
 
