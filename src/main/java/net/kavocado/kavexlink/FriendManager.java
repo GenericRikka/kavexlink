@@ -7,6 +7,7 @@ import org.bukkit.entity.Player;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -26,6 +27,16 @@ public class FriendManager {
     private final Map<UUID, List<String>> pendingNotifications = new HashMap<>();
     private final Map<UUID, Map<UUID, Integer>> unreadCounts = new HashMap<>();
 
+    // Canonical per-conversation message log:
+    // key = sorted "uuid1|uuid2", value = list of messages
+    private final Map<String, List<DmMessage>> dmMessages = new HashMap<>();
+
+    // Per-player ping sound preference: true = opted out (no ping sounds)
+    private final Map<UUID, Boolean> pingOptOut = new HashMap<>();
+
+    // Block list: blocker -> set of blocked UUIDs
+    private final Map<UUID, Set<UUID>> blocked = new HashMap<>();
+
     private final Path storageFile;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
@@ -36,12 +47,62 @@ public class FriendManager {
     }
 
     // -------------------------------------------------------
+    // DM message model
+    // -------------------------------------------------------
+
+    public static class DmMessage {
+        private final UUID from;
+        private final UUID to;
+        private final long timestamp;
+        private final String text;
+
+        public DmMessage(UUID from, UUID to, long timestamp, String text) {
+            this.from = from;
+            this.to = to;
+            this.timestamp = timestamp;
+            this.text = text;
+        }
+
+        public UUID getFrom() {
+            return from;
+        }
+
+        public UUID getTo() {
+            return to;
+        }
+
+        public long getTimestamp() {
+            return timestamp;
+        }
+
+        public String getText() {
+            return text;
+        }
+    }
+
+    private String convKey(UUID a, UUID b) {
+        String sa = a.toString();
+        String sb = b.toString();
+        return (sa.compareTo(sb) <= 0) ? sa + "|" + sb : sb + "|" + sa;
+    }
+
+    // -------------------------------------------------------
     // Friend request system
     // -------------------------------------------------------
 
     public boolean sendFriendRequest(UUID requester, UUID target) {
         if (requester.equals(target)) return false;
         if (areFriends(requester, target)) return false;
+
+        // Block rules:
+        // - if requester blocked target, they clearly don't want to interact
+        if (isBlocked(requester, target)) {
+            return false;
+        }
+        // - if target blocked requester, silently drop
+        if (isBlocked(target, requester)) {
+            return false;
+        }
 
         Set<UUID> inc = incomingRequests.computeIfAbsent(target, k -> new HashSet<>());
         Set<UUID> out = outgoingRequests.computeIfAbsent(requester, k -> new HashSet<>());
@@ -104,7 +165,7 @@ public class FriendManager {
     }
 
     // -------------------------------------------------------
-    // Friends list
+    // Friends list + unfriend
     // -------------------------------------------------------
 
     private void addFriendInternal(UUID a, UUID b) {
@@ -119,6 +180,86 @@ public class FriendManager {
         return friends.getOrDefault(p, Collections.emptySet());
     }
 
+    /**
+     * Remove friendship between a and b on both sides.
+     * Returns true if anything was changed.
+     */
+    public boolean removeFriendship(UUID a, UUID b) {
+        boolean changed = false;
+
+        Set<UUID> sa = friends.get(a);
+        if (sa != null && sa.remove(b)) {
+            changed = true;
+            if (sa.isEmpty()) friends.remove(a);
+        }
+
+        Set<UUID> sb = friends.get(b);
+        if (sb != null && sb.remove(a)) {
+            changed = true;
+            if (sb.isEmpty()) friends.remove(b);
+        }
+
+        // Clear unread counts between them
+        Map<UUID, Integer> ma = unreadCounts.get(a);
+        if (ma != null) {
+            ma.remove(b);
+            if (ma.isEmpty()) unreadCounts.remove(a);
+        }
+        Map<UUID, Integer> mb = unreadCounts.get(b);
+        if (mb != null) {
+            mb.remove(a);
+            if (mb.isEmpty()) unreadCounts.remove(b);
+        }
+
+        if (changed) {
+            saveToDisk();
+        }
+        return changed;
+    }
+
+    // -------------------------------------------------------
+    // Block system
+    // -------------------------------------------------------
+
+    public boolean isBlocked(UUID blocker, UUID other) {
+        return blocked.getOrDefault(blocker, Collections.emptySet()).contains(other);
+    }
+
+    public Set<UUID> getBlocked(UUID blocker) {
+        return blocked.getOrDefault(blocker, Collections.emptySet());
+    }
+
+    /**
+     * Block target for blocker.
+     * Also removes friendship in both directions.
+     */
+    public boolean block(UUID blocker, UUID target) {
+        if (blocker.equals(target)) return false;
+
+        Set<UUID> set = blocked.computeIfAbsent(blocker, k -> new HashSet<>());
+        if (!set.add(target)) {
+            return false; // already blocked
+        }
+
+        // Remove friendship
+        removeFriendship(blocker, target);
+
+        saveToDisk();
+        return true;
+    }
+
+    public boolean unblock(UUID blocker, UUID target) {
+        Set<UUID> set = blocked.get(blocker);
+        if (set == null || !set.remove(target)) {
+            return false;
+        }
+        if (set.isEmpty()) {
+            blocked.remove(blocker);
+        }
+        saveToDisk();
+        return true;
+    }
+
     // -------------------------------------------------------
     // Notification system
     // -------------------------------------------------------
@@ -131,6 +272,10 @@ public class FriendManager {
             pendingNotifications.computeIfAbsent(uuid, k -> new ArrayList<>()).add(msg);
             saveToDisk();
         }
+    }
+
+    public void queueNotification(UUID uuid, String msg) {
+        notifyPlayer(uuid, msg);
     }
 
     public List<String> drainNotifications(UUID uuid) {
@@ -164,6 +309,64 @@ public class FriendManager {
     public void incrementUnread(UUID owner, UUID friend) {
         unreadCounts.computeIfAbsent(owner, k -> new HashMap<>())
                 .put(friend, getUnreadCount(owner, friend) + 1);
+        saveToDisk();
+    }
+
+    // -------------------------------------------------------
+    // Direct message storage + history
+    // -------------------------------------------------------
+
+    public synchronized void storeDirectMessage(UUID from, UUID to, String text) {
+        String key = convKey(from, to);
+        List<DmMessage> list = dmMessages.computeIfAbsent(key, k -> new ArrayList<>());
+
+        long now = System.currentTimeMillis();
+        list.add(new DmMessage(from, to, now, text));
+
+        int days = plugin.getConfig().getInt("friends.dm-history-days", 30);
+        long cutoff = now - days * 24L * 60L * 60L * 1000L;
+
+        list.removeIf(m -> m.getTimestamp() < cutoff);
+
+        saveToDisk();
+    }
+
+    public synchronized List<DmMessage> getRecentMessages(UUID viewer, UUID friend, int days) {
+        String key = convKey(viewer, friend);
+        List<DmMessage> list = dmMessages.getOrDefault(key, Collections.emptyList());
+        if (list.isEmpty()) return Collections.emptyList();
+
+        long cutoff = System.currentTimeMillis() - days * 24L * 60L * 60L * 1000L;
+        List<DmMessage> result = new ArrayList<>();
+        for (DmMessage m : list) {
+            if (m.getTimestamp() >= cutoff) {
+                result.add(m);
+            }
+        }
+        return result;
+    }
+
+    // -------------------------------------------------------
+    // Ping sound preference
+    // -------------------------------------------------------
+
+    /**
+     * True = ping sounds allowed; default is true if no entry.
+     */
+    public boolean isPingEnabled(UUID uuid) {
+        return !Boolean.TRUE.equals(pingOptOut.get(uuid));
+    }
+
+    /**
+     * Set ping preference. enabled=true means allow pings.
+     * We store only opt-outs in the map to keep the JSON small.
+     */
+    public void setPingEnabled(UUID uuid, boolean enabled) {
+        if (enabled) {
+            pingOptOut.remove(uuid);
+        } else {
+            pingOptOut.put(uuid, Boolean.TRUE);
+        }
         saveToDisk();
     }
 
@@ -222,6 +425,38 @@ public class FriendManager {
             }
             root.add("unread", unreadObj);
 
+            // messages (DMs)
+            JsonObject msgObj = new JsonObject();
+            for (var e : dmMessages.entrySet()) {
+                JsonArray arr = new JsonArray();
+                for (DmMessage m : e.getValue()) {
+                    JsonObject mo = new JsonObject();
+                    mo.addProperty("from", m.getFrom().toString());
+                    mo.addProperty("to", m.getTo().toString());
+                    mo.addProperty("timestamp", m.getTimestamp());
+                    mo.addProperty("text", m.getText());
+                    arr.add(mo);
+                }
+                msgObj.add(e.getKey(), arr);
+            }
+            root.add("messages", msgObj);
+
+            // pingOptOut
+            JsonObject pingObj = new JsonObject();
+            for (var e : pingOptOut.entrySet()) {
+                pingObj.addProperty(e.getKey().toString(), e.getValue());
+            }
+            root.add("pingOptOut", pingObj);
+
+            // blocked
+            JsonObject blockObj = new JsonObject();
+            for (var e : blocked.entrySet()) {
+                JsonArray arr = new JsonArray();
+                e.getValue().forEach(uuid -> arr.add(uuid.toString()));
+                blockObj.add(e.getKey().toString(), arr);
+            }
+            root.add("blocked", blockObj);
+
             Files.writeString(storageFile, gson.toJson(root), StandardCharsets.UTF_8);
 
         } catch (Exception ex) {
@@ -235,6 +470,9 @@ public class FriendManager {
         outgoingRequests.clear();
         pendingNotifications.clear();
         unreadCounts.clear();
+        dmMessages.clear();
+        pingOptOut.clear();
+        blocked.clear();
 
         try {
             if (!Files.exists(storageFile)) return;
@@ -244,7 +482,7 @@ public class FriendManager {
 
             JsonObject root = JsonParser.parseString(json).getAsJsonObject();
 
-            // Load friends
+            // friends
             if (root.has("friends")) {
                 JsonObject obj = root.getAsJsonObject("friends");
                 for (String key : obj.keySet()) {
@@ -302,6 +540,48 @@ public class FriendManager {
                         map.put(UUID.fromString(fk), per.get(fk).getAsInt());
                     }
                     unreadCounts.put(u, map);
+                }
+            }
+
+            // messages (DMs)
+            if (root.has("messages")) {
+                JsonObject obj = root.getAsJsonObject("messages");
+                for (String key : obj.keySet()) {
+                    JsonArray arr = obj.getAsJsonArray(key);
+                    List<DmMessage> list = new ArrayList<>();
+                    for (JsonElement el : arr) {
+                        JsonObject mo = el.getAsJsonObject();
+                        UUID from = UUID.fromString(mo.get("from").getAsString());
+                        UUID to = UUID.fromString(mo.get("to").getAsString());
+                        long ts = mo.get("timestamp").getAsLong();
+                        String text = mo.has("text") ? mo.get("text").getAsString() : "";
+                        list.add(new DmMessage(from, to, ts, text));
+                    }
+                    dmMessages.put(key, list);
+                }
+            }
+
+            // pingOptOut
+            if (root.has("pingOptOut")) {
+                JsonObject obj = root.getAsJsonObject("pingOptOut");
+                for (String key : obj.keySet()) {
+                    UUID u = UUID.fromString(key);
+                    boolean val = obj.get(key).getAsBoolean();
+                    if (val) {
+                        pingOptOut.put(u, Boolean.TRUE);
+                    }
+                }
+            }
+
+            // blocked
+            if (root.has("blocked")) {
+                JsonObject obj = root.getAsJsonObject("blocked");
+                for (String key : obj.keySet()) {
+                    UUID u = UUID.fromString(key);
+                    Set<UUID> set = new HashSet<>();
+                    obj.getAsJsonArray(key)
+                            .forEach(e -> set.add(UUID.fromString(e.getAsString())));
+                    blocked.put(u, set);
                 }
             }
 

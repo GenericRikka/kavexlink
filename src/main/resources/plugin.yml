@@ -1,48 +1,73 @@
 name: KavexLink
 main: net.kavocado.kavexlink.KavexLinkPlugin
-version: ${version}
-api-version: '1.20'
+version: 0.1.0
+api-version: '1.21'
 author: GenericRikka
-description: Bi-directional Discord↔Minecraft chat via your Discord bot WebSocket
 
 commands:
   linkdiscord:
-    description: Generate a link code to connect your Minecraft account to Discord
+    description: Link your Minecraft account with Discord
     usage: "/linkdiscord"
-    permission: kavexlink.link
-
   kavexkick:
-    description: Kick a player using Discord-based permissions
-    usage: /kavexkick <player> [reason]
-    permission: kavexlink.mod
-    permission-message: You are not allowed to use this command.
-
+    description: Kick a player using Discord permissions
+    usage: "/kavexkick <player> [reason]"
   kavexban:
-    description: Ban a player using Discord-based permissions
-    usage: /kavexban <player> [reason]
-    permission: kavexlink.mod
-    permission-message: You are not allowed to use this command.
-
+    description: Permanently ban a player using Discord permissions
+    usage: "/kavexban <player> [reason]"
   kavextempban:
-    description: Temporarily ban a player using Discord-based permissions
-    usage: /kavextempban <player> <minutes> [reason]
-    permission: kavexlink.mod
-    permission-message: You are not allowed to use this command.
-
+    description: Temporarily ban a player using Discord permissions
+    usage: "/kavextempban <player> <minutes> [reason]"
   kavexmute:
-    description: Mute (timeout) a player using Discord-based permissions
-    usage: /kavexmute <player> <minutes> [reason]
-    permission: kavexlink.mod
-    permission-message: You are not allowed to use this command.
-
+    description: Temporarily mute a player using Discord permissions
+    usage: "/kavexmute <player> <minutes> [reason]"
+  kavexpardon:
+    description: Unban a player
+    usage: "/kavexpardon <player> [reason]"
+  kavexunmute:
+    description: Unmute a player
+    usage: "/kavexunmute <player> [reason]"
   friendrequest:
-    description: Send or view friend requests
-    usage: /friendrequest <player>|view
-
+    description: Manage friend requests
+    usage: "/friendrequest <subcommand>"
   friend:
-    description: Accept or deny friend requests
-    usage: /friend accept <player> | /friend deny <player>
-
+    description: Manage your friends list
+    usage: "/friend <subcommand>"
   friends:
     description: Open the friends GUI
-    usage: /friends
+    usage: "/friends"
+  dm:
+    description: Direct message a friend
+    usage: "/dm <friend> <message>"
+  reply:
+    description: Reply to the last DM partner
+    usage: "/reply <message>"
+  exit:
+    description: Leave direct-message mode
+    usage: "/exit"
+  notifyping:
+    description: Enable or disable ping sounds for mentions and DMs
+    usage: "/notifyping <on|off>"
+  setwarp:
+    description: Create or update a warp at your current position
+    usage: /setwarp <name> <public|private> [icon]
+  warps:
+    description: Open the warps GUI
+    usage: /warps [public|private]
+  warp:
+    description: Edit an existing warp
+    usage: /warp edit <name> <rename|relocate|icon|order|delete> ...
+  worlds:
+    description: Open worlds GUI
+    usage: /worlds
+  world:
+    description: World management (create/tp)
+    usage: /world <create|tp> ...
+  portal:
+    description: Portal selection and creation
+    usage: /portal
+  portals:
+    description: List and edit portals
+    usage: /portals
+  exit_mode:
+    description: Exit special edit modes (e.g. portal rebuild)
+    usage: /exit_mode

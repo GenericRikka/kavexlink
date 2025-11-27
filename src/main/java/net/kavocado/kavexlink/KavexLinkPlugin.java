@@ -1,15 +1,29 @@
 package net.kavocado.kavexlink;
 
 import org.bukkit.Bukkit;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.World;
+import org.bukkit.GameMode;
+import org.bukkit.boss.BarColor;
+import org.bukkit.boss.BarStyle;
+import org.bukkit.boss.BossBar;
 import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent.Result;
+import org.bukkit.event.player.PlayerAdvancementDoneEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.advancement.Advancement;
+import io.papermc.paper.advancement.AdvancementDisplay;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Location;
+import org.bukkit.Material;
 
 import java.io.BufferedInputStream;
 import java.io.File;
@@ -30,6 +44,10 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
+import java.util.List;
+import java.util.Locale;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -45,6 +63,8 @@ import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import net.kyori.adventure.text.format.TextColor;
+import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.event.EventHandler;
 import org.bukkit.entity.Player;
 
@@ -57,7 +77,7 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 
-public class KavexLinkPlugin extends JavaPlugin implements Listener {
+public class KavexLinkPlugin extends JavaPlugin implements Listener, TabCompleter {
 
     private Path dataDir;
     private Path secretFile;
@@ -80,6 +100,13 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
     private final Map<String, PlayerStyle> playerStyles = new ConcurrentHashMap<>();
 
     private FriendManager friendManager;
+    private WarpManager warpManager;
+    private WorldManager worldManager;
+    private NamespacedKey warpKey;
+    private NamespacedKey worldKey;
+    private PortalManager portalManager;
+    private WorldProfileManager worldProfileManager;
+
 
     private static class PlayerStyle {
         final String prefix;
@@ -157,6 +184,51 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    public WarpManager getWarpManager() {
+        return warpManager;
+    }
+
+    public WorldManager getWorldManager() {
+        return worldManager;
+    }
+
+    public NamespacedKey getWarpKey() {
+        return warpKey;
+    }
+
+    public NamespacedKey getWorldKey() {
+        return worldKey;
+    }
+
+    public PortalManager getPortalManager() {
+        return portalManager;
+    }
+
+    public WorldProfileManager getWorldProfileManager() {
+        return worldProfileManager;
+    }
+
+
+    public boolean hasWorldAdmin(Player p) {
+        // Bukkit permission override
+        if (p.hasPermission("kavexlink.worlds.admin")) {
+            return true;
+        }
+        // Fallback: use Discord-based staff flag
+        String uuid = p.getUniqueId().toString().replace("-", "");
+        PlayerStyle style = playerStyles.get(uuid);
+        return style != null && style.isStaff;
+    }
+
+    // --- Direct messaging state ---
+
+    // Last DM partner per player, used by /reply
+    private final Map<UUID, UUID> lastDmPartner = new ConcurrentHashMap<>();
+    // Active DM mode target per player (chat messages -> DM)
+    private final Map<UUID, UUID> activeDmTarget = new ConcurrentHashMap<>();
+    // BossBars that show “Direct messaging with X”
+    private final Map<UUID, BossBar> dmBossBars = new ConcurrentHashMap<>();
+
     @Override
     public void onEnable() {
         running.set(true);
@@ -165,7 +237,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         this.dataDir = getDataFolder().toPath();
         this.secretFile = dataDir.resolve("secret.txt");
 
-	new FriendCompassTask(this).runTaskTimer(this, 20L, 20L);
+        new FriendCompassTask(this).runTaskTimer(this, 20L, 20L);
 
         String motd = Bukkit.getServer().getMotd();
         this.serverName = getConfig().getString("server-name",
@@ -181,7 +253,23 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         this.sslHostname     = getConfig().getString("ssl.hostname", "").trim();
         if (this.sslHostname.isEmpty()) this.sslHostname = null;
 
-	// Moderation storage
+        // Warps & Worlds
+        this.warpManager = new WarpManager(this);
+        this.worldManager = new WorldManager(this);
+
+        this.warpKey = new NamespacedKey(this, "warp_id");
+        this.worldKey = new NamespacedKey(this, "world_id");
+
+	this.portalManager = new PortalManager(this);
+        getServer().getPluginManager().registerEvents(portalManager, this);
+
+	this.worldProfileManager = new WorldProfileManager(this);
+
+        // Listeners for GUIs
+        getServer().getPluginManager().registerEvents(new WarpsGuiListener(this), this);
+        getServer().getPluginManager().registerEvents(new WorldsGuiListener(this), this);
+
+        // Moderation storage
         this.moderationFile = dataDir.resolve("moderation.yml").toFile();
         this.moderationConfig = YamlConfiguration.loadConfiguration(moderationFile);
         loadModerationData();
@@ -241,21 +329,311 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
 
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(new FriendsListener(this), this);
+
+	// Register this plugin as TabCompleter for commands handled via onCommand
+	String[] tabbedCommands = {
+        	"setwarp",
+        	"warp",
+        	"warps",
+        	"world",
+        	"worlds",
+        	"portal",
+        	"portals",
+        	"notifyping",
+        	"dm",
+        	"kavexkick",
+        	"kavexban",
+        	"kavextempban",
+        	"kavexmute",
+        	"kavexpardon",
+        	"kavexunmute"
+	};
+
+	for (String cmdName : tabbedCommands) {
+    		if (getCommand(cmdName) != null) {
+        		getCommand(cmdName).setTabCompleter(this);
+    		}
+	}
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender,
+                                      Command command,
+                                      String alias,
+                                      String[] args) {
+        String name = command.getName().toLowerCase(Locale.ROOT);
+
+        switch (name) {
+            case "setwarp":
+                return tabCompleteSetWarp(sender, args);
+            case "warp":
+                return tabCompleteWarp(sender, args);
+            case "warps":
+                return tabCompleteWarps(sender, args);
+            case "world":
+                return tabCompleteWorld(sender, args);
+            case "worlds":
+                return Collections.emptyList(); // GUI only, no args
+            case "portal":
+                return tabCompletePortal(sender, args);
+            case "portals":
+                return tabCompletePortals(sender, args);
+            case "notifyping":
+                return tabCompleteNotifyPing(sender, args);
+            case "dm":
+                return tabCompleteDm(sender, args);
+            case "kavexkick":
+            case "kavexban":
+            case "kavextempban":
+            case "kavexmute":
+            case "kavexpardon":
+            case "kavexunmute":
+                return tabCompletePlayerFirstArg(sender, args);
+            default:
+                return Collections.emptyList();
+        }
     }
 
     public FriendManager getFriendManager() {
         return friendManager;
     }
 
+    private PlayerStyle requireStaffStyle(Player player) {
+        String uuid = player.getUniqueId().toString().replace("-", "");
+        PlayerStyle style = playerStyles.get(uuid);
+        if (style == null) {
+            player.sendMessage("§cYour Discord account is not linked or permissions have not been synced yet.");
+            return null;
+        }
+        if (!style.isStaff) {
+            player.sendMessage("§cYou must have Discord administrator/staff permissions to manage public warps.");
+            return null;
+        }
+        return style;
+    }
+
     @Override
     public void onDisable() {
-	saveModerationData();
-	if (friendManager != null) {
+        saveModerationData();
+        if (friendManager != null) {
             friendManager.saveToDisk();
         }
+
+        if (warpManager != null) {
+            warpManager.save();
+        }
+        if (worldManager != null) {
+            worldManager.saveSafely();
+	}
+
+        // Clean up bossbars
+        for (BossBar bar : dmBossBars.values()) {
+            bar.removeAll();
+        }
+        dmBossBars.clear();
+        activeDmTarget.clear();
+        lastDmPartner.clear();
+
         running.set(false);
         WebSocket ws = socketRef.getAndSet(null);
         if (ws != null) ws.abort();
+    
+	if (portalManager != null) {
+            portalManager.saveSafely();
+        }
+    }
+
+    private void updateTabListName(Player p) {
+        String key = p.getUniqueId().toString().replace("-", "");
+        PlayerStyle style = playerStyles.get(key);
+
+        // World label in gray: [world]
+        String worldName = p.getWorld().getName();
+        Component worldPart = Component.text("[" + worldName + "] ", NamedTextColor.GRAY);
+
+        if (style == null) {
+            // No special style -> just world + plain name
+            Component namePart = Component.text(p.getName(), NamedTextColor.WHITE);
+            p.playerListName(worldPart.append(namePart));
+            return;
+        }
+
+        String prefix = (style.prefix != null && !style.prefix.isEmpty())
+                ? style.prefix + " "
+                : "";
+
+        // Convert hex color to Adventure TextColor
+        TextColor tc = NamedTextColor.WHITE;
+        if (style.colorHex != null) {
+            String hex = style.colorHex.trim();
+            if (hex.matches("^#([0-9a-fA-F]{6})$")) {
+                try {
+                    int rgb = Integer.parseInt(hex.substring(1), 16);
+                    tc = TextColor.color(rgb);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+
+        Component base = worldPart;
+        if (!prefix.isEmpty()) {
+            base = base.append(Component.text(prefix, tc));
+        }
+
+        Component namePart = Component.text(p.getName(), tc)
+                .decorate(TextDecoration.BOLD);
+
+        p.playerListName(base.append(namePart));
+    }
+
+
+    // ----------------- DM BossBar helpers -----------------
+
+    private void showDmBossBar(Player p, String friendName) {
+        UUID id = p.getUniqueId();
+        BossBar bar = dmBossBars.get(id);
+
+        String title = "§bDirect messaging with §f" + friendName + " §7(/exit to leave)";
+
+        if (bar == null) {
+            bar = Bukkit.createBossBar(title, BarColor.BLUE, BarStyle.SOLID);
+            bar.setProgress(1.0);
+            bar.addPlayer(p);
+            dmBossBars.put(id, bar);
+        } else {
+            bar.setTitle(title);
+            bar.addPlayer(p);
+            bar.setVisible(true);
+        }
+    }
+
+    private void hideDmBossBar(Player p) {
+        UUID id = p.getUniqueId();
+        BossBar bar = dmBossBars.remove(id);
+        if (bar != null) {
+            bar.removeAll();
+        }
+    }
+
+    private void enterDmMode(Player p, UUID friendId, String friendName) {
+        UUID pid = p.getUniqueId();
+        activeDmTarget.put(pid, friendId);
+        showDmBossBar(p, friendName);
+    }
+
+    private void exitDmMode(Player p) {
+        UUID pid = p.getUniqueId();
+        activeDmTarget.remove(pid);
+        hideDmBossBar(p);
+    }
+
+    public void applyWorldGamemode(Player p, WorldManager.WorldEntry entry) {
+        if (entry == null) return;
+        GameMode gm = entry.getDefaultGamemode();
+        if (gm == null) return; // inherit server default
+        p.setGameMode(gm);
+    }
+
+    // ----------------- DM core helpers -----------------
+
+    /**
+     * Start / open a DM session from a viewer to a friend.
+     * Shows recent history and puts viewer into DM mode.
+     */
+    public void openDmSession(Player viewer, UUID friendId) {
+        UUID viewerId = viewer.getUniqueId();
+
+        if (!friendManager.areFriends(viewerId, friendId)) {
+            viewer.sendMessage("§cYou can only direct-message players who are your friends.");
+            return;
+        }
+
+        OfflinePlayer op = Bukkit.getOfflinePlayer(friendId);
+        String friendName = (op.getName() != null ? op.getName() : friendId.toString());
+
+        lastDmPartner.put(viewerId, friendId);
+        friendManager.clearUnread(viewerId, friendId);
+        enterDmMode(viewer, friendId, friendName);
+
+        int days = getConfig().getInt("friends.dm-history-days", 30);
+        java.util.List<FriendManager.DmMessage> history =
+                friendManager.getRecentMessages(viewerId, friendId, days);
+
+        viewer.sendMessage("§7=== Direct messages with §e" + friendName
+                + " §7(last " + days + " day(s)) ===");
+        if (history.isEmpty()) {
+            viewer.sendMessage("§7No recent messages.");
+        } else {
+            history.sort(java.util.Comparator.comparingLong(FriendManager.DmMessage::getTimestamp));
+            for (FriendManager.DmMessage m : history) {
+                boolean fromViewer = m.getFrom().equals(viewerId);
+                String prefix = fromViewer
+                        ? "§d[You → " + friendName + "] §r"
+                        : "§d[" + friendName + " → You] §r";
+                viewer.sendMessage(prefix + m.getText());
+            }
+        }
+        viewer.sendMessage("§7You are now in direct-message mode with §e" + friendName
+                + "§7. Type messages to DM them, or use §e/exit §7to go back to public chat.");
+    }
+
+    /**
+     * Send a direct message from 'from' to 'targetId'.
+     * Also persists the message, updates unread counts, and handles notifications/pings.
+     */
+    private void sendDirectMessage(Player from, UUID targetId, String text) {
+        UUID fromId = from.getUniqueId();
+
+        if (fromId.equals(targetId)) {
+            from.sendMessage("§cYou cannot direct-message yourself.");
+            return;
+        }
+
+        if (!friendManager.areFriends(fromId, targetId)) {
+            from.sendMessage("§cYou can only direct-message players who are your friends.");
+            exitDmMode(from);
+            return;
+        }
+
+        OfflinePlayer targetOp = Bukkit.getOfflinePlayer(targetId);
+        String targetName = (targetOp.getName() != null ? targetOp.getName() : targetId.toString());
+
+        text = text.trim();
+        if (text.isEmpty()) {
+            from.sendMessage("§7Your message was empty.");
+            return;
+        }
+
+        // Persist & unread count
+        friendManager.storeDirectMessage(fromId, targetId, text);
+        friendManager.incrementUnread(targetId, fromId);
+
+        // remember last partner for both sides
+        lastDmPartner.put(fromId, targetId);
+
+        Player targetOnline = Bukkit.getPlayer(targetId);
+        if (targetOnline != null && targetOnline.isOnline()) {
+            lastDmPartner.put(targetId, fromId);
+        }
+
+        // sender view
+        from.sendMessage("§d[DM to " + targetName + "] §r" + text);
+
+        // receiver view
+        if (targetOnline != null && targetOnline.isOnline()) {
+            targetOnline.sendMessage("§d[DM from " + from.getName() + "] §r" + text);
+            // DM ping
+            notifyPing(targetOnline.getName());
+        } else {
+            friendManager.queueNotification(
+                    targetId,
+                    "§bYou have a new direct message from §e" + from.getName()
+                            + "§b. Use §e/friends §bto view & reply."
+            );
+        }
+
+        // keep DM mode active with bossbar
+        enterDmMode(from, targetId, targetName);
     }
 
     private void requestPermStyle(Player player) {
@@ -326,7 +704,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         tmf.init(ks);
         return tmf;
     }
-    
+
     private String hexToMinecraftColor(String hex) {
         if (hex == null) return "§f";
         hex = hex.trim();
@@ -504,7 +882,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         ConfigurationSection bansSec = moderationConfig.getConfigurationSection("bans");
         if (bansSec != null) {
             for (String uuid : bansSec.getKeys(false)) {
-                String path = "bans." + uuid + ".";
                 String name = bansSec.getString(uuid + ".name", "Unknown");
                 long createdAt = bansSec.getLong(uuid + ".createdAt", 0L);
                 long expiresAt = bansSec.getLong(uuid + ".expiresAt", 0L);
@@ -521,7 +898,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         ConfigurationSection mutesSec = moderationConfig.getConfigurationSection("mutes");
         if (mutesSec != null) {
             for (String uuid : mutesSec.getKeys(false)) {
-                String path = "mutes." + uuid + ".";
                 String name = mutesSec.getString(uuid + ".name", "Unknown");
                 long createdAt = mutesSec.getLong(uuid + ".createdAt", 0L);
                 long expiresAt = mutesSec.getLong(uuid + ".expiresAt", 0L);
@@ -571,6 +947,384 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private List<String> tabCompleteMaterials(String partial) {
+        String p = partial == null ? "" : partial.toUpperCase();
+        List<String> result = new ArrayList<>();
+
+        for (Material m : Material.values()) {
+            if (!m.isItem()) continue;              // only things you can hold as an item
+            String name = m.name();                 // e.g. DIAMOND_SWORD
+            if (p.isEmpty() || name.startsWith(p)) {
+                result.add(name);
+            }
+        }
+        return result;
+    }
+
+    private List<String> tabCompleteSetWarp(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+
+        // /setwarp <name> <public|private> [icon]
+        if (args.length == 2) {
+            String partial = args[1].toLowerCase();
+            List<String> options = new ArrayList<>();
+            if ("public".startsWith(partial))  options.add("public");
+            if ("private".startsWith(partial)) options.add("private");
+            return options;
+        }
+
+        if (args.length == 3) {
+            // icon argument
+            return tabCompleteMaterials(args[2]);
+        }
+
+        return Collections.emptyList();
+    }
+
+    private List<String> tabCompleteWarp(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+
+        // /warp edit <name> <rename|relocate|icon|order|delete> ...
+        if (args.length == 1) {
+            // subcommand - we only support "edit" right now
+            String partial = args[0].toLowerCase();
+            if ("edit".startsWith(partial)) {
+                return Collections.singletonList("edit");
+            }
+            return Collections.emptyList();
+        }
+
+        if (args.length == 3 && "edit".equalsIgnoreCase(args[0])) {
+            // edit subcommand name: <rename|relocate|icon|order|delete>
+            String partial = args[2].toLowerCase();
+            List<String> subs = new ArrayList<>();
+            if ("rename".startsWith(partial))   subs.add("rename");
+            if ("relocate".startsWith(partial)) subs.add("relocate");
+            if ("icon".startsWith(partial))     subs.add("icon");
+            if ("order".startsWith(partial))    subs.add("order");
+            if ("delete".startsWith(partial))   subs.add("delete");
+            return subs;
+        }
+
+        if (args.length == 4
+                && "edit".equalsIgnoreCase(args[0])
+                && "icon".equalsIgnoreCase(args[2])) {
+            // /warp edit <name> icon <material>
+            return tabCompleteMaterials(args[3]);
+        }
+
+        return Collections.emptyList();
+    }
+
+    private List<String> tabCompleteWorld(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+
+        if (args.length == 1) {
+            // subcommand: create|tp|import|edit
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            List<String> subs = new ArrayList<>();
+            if ("create".startsWith(partial)) subs.add("create");
+            if ("tp".startsWith(partial))     subs.add("tp");
+            if ("import".startsWith(partial)) subs.add("import");
+            if ("edit".startsWith(partial))   subs.add("edit");
+            return subs;
+        }
+
+        String sub = args[0].toLowerCase(Locale.ROOT);
+
+        // /world create <name> <mode> <access> [icon] [seed...]
+        if (sub.equals("create")) {
+            if (args.length == 3) {
+                // mode: default|flat|large
+                String partial = args[2].toLowerCase(Locale.ROOT);
+                List<String> modes = new ArrayList<>();
+                if ("default".startsWith(partial)) modes.add("default");
+                if ("flat".startsWith(partial))    modes.add("flat");
+                if ("large".startsWith(partial))   modes.add("large");
+                return modes;
+            }
+
+            if (args.length == 4) {
+                // access: public|private
+                String partial = args[3].toLowerCase(Locale.ROOT);
+                List<String> access = new ArrayList<>();
+                if ("public".startsWith(partial))  access.add("public");
+                if ("private".startsWith(partial)) access.add("private");
+                return access;
+            }
+
+            if (args.length == 5) {
+                // icon material
+                return tabCompleteMaterials(args[4]);
+            }
+
+            // seed (args.length >= 6) -> free text
+            return Collections.emptyList();
+        }
+
+        // /world tp <name> [player]
+        if (sub.equals("tp")) {
+            if (args.length == 2) {
+                // suggest world names from loaded Bukkit worlds
+                String partial = args[1].toLowerCase(Locale.ROOT);
+                List<String> worlds = new ArrayList<>();
+                for (World w : Bukkit.getWorlds()) {
+                    String n = w.getName();
+                    if (n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                        worlds.add(n);
+                    }
+                }
+                Collections.sort(worlds, String.CASE_INSENSITIVE_ORDER);
+                return worlds;
+            }
+            // player argument: could add player completion later if you like
+            return Collections.emptyList();
+        }
+
+        // /world import <folderName>  -> no good generic completion for folders
+        if (sub.equals("import")) {
+            return Collections.emptyList();
+        }
+
+        // /world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...
+        if (sub.equals("edit")) {
+            if (args.length == 3) {
+                // action
+                String partial = args[2].toLowerCase(Locale.ROOT);
+                List<String> actions = new ArrayList<>();
+                if ("rename".startsWith(partial))   actions.add("rename");
+                if ("access".startsWith(partial))   actions.add("access");
+                if ("icon".startsWith(partial))     actions.add("icon");
+                if ("order".startsWith(partial))    actions.add("order");
+                if ("delete".startsWith(partial))   actions.add("delete");
+                if ("inv".startsWith(partial))      actions.add("inv");
+                if ("stats".startsWith(partial))    actions.add("stats");
+                if ("reset".startsWith(partial))    actions.add("reset");
+                if ("gamemode".startsWith(partial)) actions.add("gamemode");
+                return actions;
+            }
+
+            if (args.length == 4) {
+                // value depending on action
+                String action = args[2].toLowerCase(Locale.ROOT);
+                String partial = args[3].toLowerCase(Locale.ROOT);
+                List<String> out = new ArrayList<>();
+
+                switch (action) {
+                    case "access" -> {
+                        if ("public".startsWith(partial))  out.add("public");
+                        if ("private".startsWith(partial)) out.add("private");
+                    }
+                    case "icon" -> {
+                        return tabCompleteMaterials(args[3]);
+                    }
+                    case "inv", "stats" -> {
+                        if ("shared".startsWith(partial))   out.add("shared");
+                        if ("separate".startsWith(partial)) out.add("separate");
+                    }
+                    case "reset" -> {
+                        if ("health".startsWith(partial)) out.add("health");
+                        if ("hunger".startsWith(partial)) out.add("hunger");
+                        if ("both".startsWith(partial))   out.add("both");
+                        if ("off".startsWith(partial))    out.add("off");
+                    }
+                    case "gamemode" -> {
+                        if ("survival".startsWith(partial))  out.add("survival");
+                        if ("creative".startsWith(partial))  out.add("creative");
+                        if ("adventure".startsWith(partial)) out.add("adventure");
+                        if ("spectator".startsWith(partial)) out.add("spectator");
+                        if ("inherit".startsWith(partial))   out.add("inherit");
+                    }
+                    default -> {
+                        // rename/order/delete don't really have good completions here
+                    }
+                }
+                return out;
+            }
+
+            return Collections.emptyList();
+        }
+
+        return Collections.emptyList();
+    }
+
+    private List<String> tabCompleteWarps(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+
+        if (args.length == 1) {
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            List<String> options = new ArrayList<>();
+            if ("public".startsWith(partial))  options.add("public");
+            if ("private".startsWith(partial)) options.add("private");
+            return options;
+        }
+
+        return Collections.emptyList();
+    }
+
+    private List<String> tabCompleteNotifyPing(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+
+        if (args.length == 1) {
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            List<String> options = new ArrayList<>();
+            if ("on".startsWith(partial))  options.add("on");
+            if ("off".startsWith(partial)) options.add("off");
+            return options;
+        }
+
+        return Collections.emptyList();
+    }
+
+    private List<String> tabCompletePlayerFirstArg(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+        if (args.length != 1) {
+            return Collections.emptyList();
+        }
+
+        String partial = args[0].toLowerCase(Locale.ROOT);
+        List<String> names = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            String n = p.getName();
+            if (n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                names.add(n);
+            }
+        }
+        Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+        return names;
+    }
+
+    private List<String> tabCompleteDm(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            return Collections.emptyList();
+        }
+        if (friendManager == null) {
+            return Collections.emptyList();
+        }
+        if (args.length != 1) {
+            return Collections.emptyList();
+        }
+
+        String partial = args[0].toLowerCase(Locale.ROOT);
+        List<String> out = new ArrayList<>();
+        UUID self = p.getUniqueId();
+        Set<UUID> friends = friendManager.getFriends(self);
+        if (friends == null || friends.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        for (UUID fid : friends) {
+            Player fp = Bukkit.getPlayer(fid);
+            if (fp == null || !fp.isOnline()) continue;
+            String n = fp.getName();
+            if (n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                out.add(n);
+            }
+        }
+        Collections.sort(out, String.CASE_INSENSITIVE_ORDER);
+        return out;
+    }
+
+    private List<String> tabCompletePortal(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            return Collections.emptyList();
+        }
+        if (portalManager == null) {
+            return Collections.emptyList();
+        }
+
+        if (args.length == 1) {
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            List<String> subs = new ArrayList<>();
+            if ("wand".startsWith(partial))    subs.add("wand");
+            if ("create".startsWith(partial))  subs.add("create");
+            if ("rebuild".startsWith(partial)) subs.add("rebuild");
+            return subs;
+        }
+
+        String sub = args[0].toLowerCase(Locale.ROOT);
+
+        // /portal create <name> <world-or-warp>
+        if (sub.equals("create") && args.length == 3) {
+            // Suggest world names for the target
+            String partial = args[2].toLowerCase(Locale.ROOT);
+            List<String> worlds = new ArrayList<>();
+            for (World w : Bukkit.getWorlds()) {
+                String n = w.getName();
+                if (n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                    worlds.add(n);
+                }
+            }
+            Collections.sort(worlds, String.CASE_INSENSITIVE_ORDER);
+            return worlds;
+        }
+
+        return Collections.emptyList();
+    }
+
+    private List<String> tabCompletePortals(CommandSender sender, String[] args) {
+        if (portalManager == null) {
+            return Collections.emptyList();
+        }
+
+        if (args.length == 1) {
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            List<String> subs = new ArrayList<>();
+            if ("list".startsWith(partial)) subs.add("list");
+            if ("edit".startsWith(partial)) subs.add("edit");
+            return subs;
+        }
+
+        String sub = args[0].toLowerCase(Locale.ROOT);
+
+        // /portals edit <name> <...>
+        if (sub.equals("edit")) {
+            if (args.length == 2) {
+                // portal name
+                String partial = args[1].toLowerCase(Locale.ROOT);
+                List<String> names = new ArrayList<>();
+                for (PortalManager.PortalEntry e : portalManager.getAllPortalsSorted()) {
+                    String n = e.getName();
+                    if (n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                        names.add(n);
+                    }
+                }
+                Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+                return names;
+            }
+
+            if (args.length == 3) {
+                // action: activate|deactivate|changetarget|changearea|delete
+                String partial = args[2].toLowerCase(Locale.ROOT);
+                List<String> actions = new ArrayList<>();
+                if ("activate".startsWith(partial))    actions.add("activate");
+                if ("deactivate".startsWith(partial))  actions.add("deactivate");
+                if ("changetarget".startsWith(partial)) actions.add("changetarget");
+                if ("changearea".startsWith(partial))   actions.add("changearea");
+                if ("delete".startsWith(partial))      actions.add("delete");
+                return actions;
+            }
+
+            // no further structured args worth completing here
+            return Collections.emptyList();
+        }
+
+        return Collections.emptyList();
+    }
+
+
     // ---------- WebSocket connection / retry ----------
 
     private void connectWithRetry() {
@@ -595,14 +1349,13 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 } catch (Exception e) {
                     if (!running.get()) break;
 
-                    // MORE VERBOSE LOGGING
                     getLogger().warning("WS connect failed: " + e.getClass().getName() + ": " + e.getMessage());
                     Throwable cause = e.getCause();
                     while (cause != null) {
                         getLogger().warning("  cause: " + cause.getClass().getName() + ": " + cause.getMessage());
                         cause = cause.getCause();
                     }
-                    e.printStackTrace(); // full stack trace to console
+                    e.printStackTrace();
 
                     try {
                         Thread.sleep(5000);
@@ -678,38 +1431,38 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         switch (op) {
             case "dc_chat": {
                 String user = obj.has("user") && !obj.get("user").isJsonNull()
-                    ? obj.get("user").getAsString()
-                    : "discord";
+                        ? obj.get("user").getAsString()
+                        : "discord";
                 String guild = obj.has("guild") && !obj.get("guild").isJsonNull()
-                    ? obj.get("guild").getAsString()
-                    : "guild";
+                        ? obj.get("guild").getAsString()
+                        : "guild";
                 String text = obj.has("text") && !obj.get("text").isJsonNull()
-                    ? obj.get("text").getAsString()
-                    : "";
+                        ? obj.get("text").getAsString()
+                        : "";
 
                 String prefix = obj.has("prefix") && !obj.get("prefix").isJsonNull()
-                    ? obj.get("prefix").getAsString()
-                    : "";
+                        ? obj.get("prefix").getAsString()
+                        : "";
                 String colorHex = obj.has("color") && !obj.get("color").isJsonNull()
-                    ? obj.get("color").getAsString()
-                    : null;
+                        ? obj.get("color").getAsString()
+                        : null;
 
                 String colorCode = hexToMinecraftColor(colorHex);
                 String prefixPart = prefix.isEmpty() ? "" : prefix + " ";
 
                 final String finalMsg =
-                    colorCode
-                    + prefixPart
-                    + "§l" + user
-                    + "§r§7@" + guild + "§r"  + ": "
-                    + text;
+                        colorCode
+                                + prefixPart
+                                + "§l" + user
+                                + "§r§7@" + guild + "§r" + ": "
+                                + text;
 
                 Bukkit.getScheduler().runTask(this,
-                    () -> Bukkit.broadcastMessage(finalMsg));
+                        () -> Bukkit.broadcastMessage(finalMsg));
                 getLogger().info("Broadcasted dc_chat from " + user + "@" + guild);
                 break;
             }
-	    case "auth": {
+            case "auth": {
                 getLogger().info("WS auth ack: " + json);
                 break;
             }
@@ -717,7 +1470,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 handleDcAdmin(obj);
                 break;
             }
-	    case "mc_permset": {
+            case "mc_permset": {
                 String uuid = obj.has("uuid") && !obj.get("uuid").isJsonNull()
                         ? obj.get("uuid").getAsString()
                         : null;
@@ -743,12 +1496,28 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                     getLogger().info("Updated style for uuid=" + uuid
                             + " prefix=" + prefix + " color=" + colorHex
                             + " perms: kick=" + canKick + " ban=" + canBan + " timeout=" + canTimeout);
-                } else {
+                    // Try to update tablist style for this player if they are online
+                    try {
+                        if (uuid != null && uuid.length() == 32) {
+                            String dashed = uuid.replaceFirst(
+                                "(\\p{XDigit}{8})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}+)",
+                                "$1-$2-$3-$4-$5"
+                            );
+                            java.util.UUID u = java.util.UUID.fromString(dashed);
+                            Player p = Bukkit.getPlayer(u);
+                            if (p != null && p.isOnline()) {
+                                Bukkit.getScheduler().runTask(this, () -> updateTabListName(p));
+                            }
+                        }
+                    } catch (Exception ex) {
+                        getLogger().warning("Failed to apply tablist style: " + ex);
+                    }
+		} else {
                     getLogger().info("mc_permset without uuid, ignoring");
                 }
                 break;
             }
-	    case "dc_notify": {
+            case "dc_notify": {
                 String mcName = obj.has("mc_name") && !obj.get("mc_name").isJsonNull()
                         ? obj.get("mc_name").getAsString()
                         : "";
@@ -756,8 +1525,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                     notifyPing(mcName);
                 }
                 break;
-            } 
-	    default: {
+            }
+            default: {
                 getLogger().info("WS unknown op: " + op);
                 break;
             }
@@ -785,7 +1554,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         String uuid = p.getUniqueId().toString().replace("-", "");
         String name = p.getName();
 
-        // Send link request over WS
         String payload = "{\"op\":\"mc_link_request\","
                 + "\"uuid\":\"" + uuid + "\","
                 + "\"name\":\"" + escape(name) + "\","
@@ -803,7 +1571,254 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         sender.sendMessage("§7Open the Discord server and run §b/linkdiscord " + code + "§7.");
         return true;
     }
-   
+
+    private boolean handleSetWarp(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+
+        if (args.length < 2) {
+            p.sendMessage("§7Usage: §e/setwarp <name> <public|private> [icon]");
+            return true;
+        }
+
+        String name = args[0];
+        if (name.length() > 32) {
+            p.sendMessage("§cWarp name is too long (max 32 characters).");
+            return true;
+        }
+
+        String visibility = args[1].toLowerCase();
+        boolean isPublic;
+        if (visibility.startsWith("pub")) {
+            isPublic = true;
+        } else if (visibility.startsWith("pri")) {
+            isPublic = false;
+        } else {
+            p.sendMessage("§cVisibility must be either 'public' or 'private'.");
+            return true;
+        }
+
+        if (isPublic) {
+            if (requireStaffStyle(p) == null) {
+                return true;
+            }
+        }
+
+        Material icon = Material.DIRT;
+        if (args.length >= 3) {
+            Material m = Material.matchMaterial(args[2]);
+            if (m == null) {
+                p.sendMessage("§cUnknown material: §f" + args[2]);
+                p.sendMessage("§7Example: §eDIAMOND_SWORD§7 or §eSTONE");
+                return true;
+            }
+            if (!m.isItem()) {
+                p.sendMessage("§c" + m.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
+                p.sendMessage("§7Try something like §eLAVA_BUCKET§7 instead.");
+                return true;
+            }
+            icon = m;
+        }
+
+        if (warpManager == null) {
+            p.sendMessage("§cWarp system is not initialized.");
+            return true;
+        }
+
+        if (isPublic) {
+            WarpManager.Warp existing = warpManager.getPublicWarp(name);
+            if (existing != null) {
+                warpManager.updateWarpLocation(existing, p.getLocation());
+                warpManager.updateWarpIcon(existing, icon);
+                p.sendMessage("§aUpdated public warp §e" + name + "§a at your current location.");
+            } else {
+                warpManager.createWarp(p.getUniqueId(), true, name, p.getLocation(), icon);
+                p.sendMessage("§aCreated new public warp §e" + name + "§a.");
+            }
+        } else {
+            WarpManager.Warp existing = warpManager.getPrivateWarp(p.getUniqueId(), name);
+            if (existing != null) {
+                warpManager.updateWarpLocation(existing, p.getLocation());
+                warpManager.updateWarpIcon(existing, icon);
+                p.sendMessage("§aUpdated your private warp §e" + name + "§a.");
+            } else {
+                warpManager.createWarp(p.getUniqueId(), false, name, p.getLocation(), icon);
+                p.sendMessage("§aCreated new private warp §e" + name + "§a.");
+            }
+        }
+
+        warpManager.save();
+        return true;
+    }
+
+    private boolean handleWarps(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+
+        if (warpManager == null) {
+            p.sendMessage("§cWarp system is not initialized.");
+            return true;
+        }
+
+        if (args.length == 0 || args[0].equalsIgnoreCase("public")) {
+            WarpsGui.openPublicWarps(this, p);
+        } else if (args[0].equalsIgnoreCase("private")) {
+            WarpsGui.openPrivateWarps(this, p);
+        } else {
+            p.sendMessage("§7Usage: §e/warps [public|private]");
+        }
+        return true;
+    }
+
+    private boolean handleWarpEdit(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+
+        if (warpManager == null) {
+            p.sendMessage("§cWarp system is not initialized.");
+            return true;
+        }
+
+        if (args.length < 2 || !args[0].equalsIgnoreCase("edit")) {
+            p.sendMessage("§7Usage: §e/warp edit <name> <rename|relocate|icon|order|delete> ...");
+            return true;
+        }
+
+        String name = args[1];
+
+        boolean isStaff = false;
+        PlayerStyle style = playerStyles.get(p.getUniqueId().toString().replace("-", ""));
+        if (style != null && style.isStaff) {
+            isStaff = true;
+        }
+
+        WarpManager.Warp warp = null;
+        boolean editingPublic = false;
+
+        if (isStaff) {
+            WarpManager.Warp publicWarp = warpManager.getPublicWarp(name);
+            if (publicWarp != null) {
+                warp = publicWarp;
+                editingPublic = true;
+            }
+        }
+
+        if (warp == null) {
+            warp = warpManager.getPrivateWarp(p.getUniqueId(), name);
+            editingPublic = false;
+        }
+
+        if (warp == null) {
+            p.sendMessage("§cNo warp named §e" + name + "§c found.");
+            return true;
+        }
+
+        if (editingPublic && !isStaff) {
+            if (requireStaffStyle(p) == null) return true;
+        }
+
+        if (args.length < 3) {
+            p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|delete> ...");
+            return true;
+        }
+
+        String sub = args[2].toLowerCase();
+        switch (sub) {
+            case "rename": {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " rename <newName>");
+                    return true;
+                }
+                String newName = args[3];
+                if (newName.length() > 32) {
+                    p.sendMessage("§cNew warp name is too long (max 32 characters).");
+                    return true;
+                }
+
+                if (warp.isPublicWarp()) {
+                    WarpManager.Warp conflict = warpManager.getPublicWarp(newName);
+                    if (conflict != null && conflict != warp) {
+                        p.sendMessage("§cAnother public warp with that name already exists.");
+                        return true;
+                    }
+                } else {
+                    WarpManager.Warp conflict = warpManager.getPrivateWarp(p.getUniqueId(), newName);
+                    if (conflict != null && conflict != warp) {
+                        p.sendMessage("§cYou already have a private warp with that name.");
+                        return true;
+                    }
+                }
+
+                warpManager.renameWarp(warp, newName);
+                warpManager.save();
+                p.sendMessage("§aWarp renamed to §e" + newName + "§a.");
+                break;
+            }
+            case "relocate": {
+                warpManager.updateWarpLocation(warp, p.getLocation());
+                warpManager.save();
+                p.sendMessage("§aWarp §e" + warp.getName() + "§a moved to your current location.");
+                break;
+            }
+            case "icon": {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " icon <material>");
+                    return true;
+                }
+                Material mat = Material.matchMaterial(args[3]);
+                if (mat == null) {
+                    p.sendMessage("§cUnknown material: §f" + args[3]);
+                    return true;
+                }
+                if (!mat.isItem()) {
+                    p.sendMessage("§c" + mat.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
+                    p.sendMessage("§7Use an actual item like §eLAVA_BUCKET§7, §eNETHERRACK§7, etc.");
+                    return true;
+                }
+                warpManager.updateWarpIcon(warp, mat);
+                warpManager.save();
+                p.sendMessage("§aUpdated icon for warp §e" + warp.getName() + "§a.");
+                break;
+            }
+            case "order": {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " order <number>");
+                    return true;
+                }
+                int order;
+                try {
+                    order = Integer.parseInt(args[3]);
+                } catch (NumberFormatException ex) {
+                    p.sendMessage("§cOrder must be an integer.");
+                    return true;
+                }
+                if (order < 0) order = 0;
+                warpManager.updateWarpOrder(warp, order);
+                warpManager.save();
+                p.sendMessage("§aUpdated GUI order for warp §e" + warp.getName() + "§a to §e" + order + "§a.");
+                break;
+            }
+            case "delete": {
+                warpManager.deleteWarp(warp);
+                warpManager.save();
+                p.sendMessage("§cDeleted warp §e" + name + "§c.");
+                break;
+            }
+            default: {
+                p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|delete> ...");
+                break;
+            }
+        }
+
+        return true;
+    }
+
     private PlayerStyle requireStyleWithMessage(Player player, boolean checkKick, boolean checkBan, boolean checkTimeout) {
         String uuid = player.getUniqueId().toString().replace("-", "");
         PlayerStyle style = playerStyles.get(uuid);
@@ -853,8 +1868,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
 
         target.kick(Component.text("You were kicked: " + reason, NamedTextColor.RED));
         Bukkit.broadcastMessage("§c" + target.getName() + " was kicked by " + player.getName() + ".");
-	sendModEvent("kick", target.getName(), player.getName(), reason, 0);
-	return true;
+        sendModEvent("kick", target.getName(), player.getName(), reason, 0);
+        return true;
     }
 
     private boolean handleKavexBan(org.bukkit.command.CommandSender sender, String[] args) {
@@ -896,8 +1911,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
 
         target.kick(Component.text("You are banned: " + reason, NamedTextColor.RED));
         Bukkit.broadcastMessage("§c" + target.getName() + " was banned by " + player.getName() + ".");
-	sendModEvent("ban", target.getName(), player.getName(), reason, 0);
-	return true;
+        sendModEvent("ban", target.getName(), player.getName(), reason, 0);
+        return true;
     }
 
     private boolean handleKavexTempBan(org.bukkit.command.CommandSender sender, String[] args) {
@@ -952,13 +1967,13 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         saveModerationData();
 
         target.kick(Component.text(
-            "You are temporarily banned for " + minutes + " minute(s): " + reason,
+                "You are temporarily banned for " + minutes + " minute(s): " + reason,
                 NamedTextColor.RED
         ));
         Bukkit.broadcastMessage("§c" + target.getName() + " was tempbanned for " + minutes
-            + " minute(s) by " + player.getName() + ".");
-	sendModEvent("tempban", target.getName(), player.getName(), reason, minutes);
-	return true;
+                + " minute(s) by " + player.getName() + ".");
+        sendModEvent("tempban", target.getName(), player.getName(), reason, minutes);
+        return true;
     }
 
     private boolean handleKavexMute(org.bukkit.command.CommandSender sender, String[] args) {
@@ -1016,7 +2031,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 + " minute(s): " + reason);
         Bukkit.broadcastMessage("§e" + target.getName() + " was muted for " + minutes
                 + " minute(s) by " + player.getName() + ".");
-	sendModEvent("mute", target.getName(), player.getName(), reason, minutes);
+        sendModEvent("mute", target.getName(), player.getName(), reason, minutes);
         return true;
     }
 
@@ -1027,6 +2042,12 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         Player p = e.getPlayer();
         sendEvent("join", p, "connected");
         requestPermStyle(p);
+        updateTabListName(p);
+
+        // NEW: apply per-world profile on first join
+        if (worldProfileManager != null) {
+            worldProfileManager.handleJoin(p);
+        }
 
         UUID uuid = p.getUniqueId();
         for (String msg : friendManager.drainNotifications(uuid)) {
@@ -1056,8 +2077,10 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 friend.sendMessage("§cYour friend §e" + p.getName() + " §chas left the game.");
             }
         }
-    }
 
+        // clean DM state on quit
+        exitDmMode(p);
+    }
 
     @EventHandler
     public void onPlayerDeath(PlayerDeathEvent e) {
@@ -1070,6 +2093,52 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
         if (text == null || text.isEmpty()) text = "died";
         sendEvent("death", p, text);
+    }
+
+    @EventHandler
+    public void onAdvancement(PlayerAdvancementDoneEvent e) {
+        Player p = e.getPlayer();
+        Advancement adv = e.getAdvancement();
+        if (adv == null) return;
+
+        NamespacedKey key = adv.getKey();
+        String path = key.getKey();
+        // Skip recipe advancements to avoid spam
+        if (path.startsWith("recipes/") || path.startsWith("recipe/")) {
+            return;
+        }
+
+        AdvancementDisplay display = adv.getDisplay();
+        String title = null;
+
+        if (display != null) {
+            // Paper 1.21: title() is an Adventure Component
+            title = PlainTextComponentSerializer.plainText().serialize(display.title());
+        }
+
+        if (title == null || title.isEmpty()) {
+            // Fallback to key if no nice title
+            title = path.replace('_', ' ');
+        }
+
+        String text = "made the advancement [" + title + "]";
+        sendEvent("advancement", p, text);
+    }
+
+    @EventHandler
+    public void onWorldChange(PlayerChangedWorldEvent e) {
+        Player p = e.getPlayer();
+        String from = e.getFrom().getName();
+        String to = p.getWorld().getName();
+
+        // NEW: switch per-world profile
+        if (worldProfileManager != null) {
+            worldProfileManager.handleWorldChange(p, e.getFrom(), p.getWorld());
+        }
+
+        String text = "switched from world \"" + from + "\" to \"" + to + "\"";
+        sendEvent("world_change", p, text);
+        updateTabListName(p);
     }
 
     private void sendEvent(String etype, Player player, String text) {
@@ -1123,15 +2192,23 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
             return;
         }
 
+        // Respect per-player ping preference
+        try {
+            if (friendManager != null &&
+                    !friendManager.isPingEnabled(target.getUniqueId())) {
+                return;
+            }
+        } catch (Exception ignored) {
+            // fail open (play sound) if something goes wrong
+        }
+
         // play two note-block chimes as a "ping"
-        // 1st now
         target.playSound(
                 target.getLocation(),
                 org.bukkit.Sound.BLOCK_NOTE_BLOCK_PLING,
                 1.0f,
                 1.0f
         );
-        // 2nd a short time later (3 ticks ≈ 0.15s)
         Bukkit.getScheduler().runTaskLater(
                 this,
                 () -> target.playSound(
@@ -1154,13 +2231,11 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
             return true;
         }
 
-        // Requires Discord Ban perms (same as /kavexban)
         PlayerStyle style = requireStyleWithMessage(player, false, true, false);
         if (style == null) return true;
 
         String targetName = args[0];
 
-        // Try by online player, then by stored name
         String banUuid = null;
         BanEntry entry = null;
 
@@ -1207,7 +2282,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
             return true;
         }
 
-        // Requires Discord timeout/mod perms (same as /kavexmute)
         PlayerStyle style = requireStyleWithMessage(player, false, false, true);
         if (style == null) return true;
 
@@ -1252,7 +2326,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         return true;
     }
 
-
     @EventHandler
     public void onPreLogin(AsyncPlayerPreLoginEvent e) {
         String uuid = e.getUniqueId().toString().replace("-", "");
@@ -1264,7 +2337,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // ---- Admin commands ----
+    // ---- Admin commands from Discord ----
 
     private void handleDcAdmin(JsonObject obj) {
         String action = obj.has("action") && !obj.get("action").isJsonNull()
@@ -1342,7 +2415,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                         getLogger().info("dc_admin tempban: player not online: " + playerName);
                         return;
                     }
-                    // minutes is effectively final; derive a local effectiveMinutes
                     int effectiveMinutes = (minutes <= 0) ? 1 : minutes;
 
                     String uuid = target.getUniqueId().toString().replace("-", "");
@@ -1471,7 +2543,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
     }
 
     private String generateLinkCode() {
-        // Simple 8-char alphanumeric code
         String chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         SecureRandom rnd = new SecureRandom();
         StringBuilder sb = new StringBuilder(8);
@@ -1480,6 +2551,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
         }
         return sb.toString();
     }
+
+    // ---- Commands ----
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
@@ -1499,13 +2572,827 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
                 return handleKavexPardon(sender, args);
             case "kavexunmute":
                 return handleKavexUnmute(sender, args);
+            case "dm":
+                return handleDm(sender, args);
+            case "reply":
+                return handleReply(sender, args);
+            case "exit":
+                return handleExitDm(sender, args);
+            case "notifyping":
+                return handleNotifyPing(sender, args);
+            case "setwarp":
+                return handleSetWarp(sender, args);
+            case "warps":
+                return handleWarps(sender, args);
+            case "warp":
+                return handleWarpEdit(sender, args);
+            case "worlds":
+                return handleWorlds(sender, args);
+            case "world":
+                return handleWorld(sender, args);
+            case "portal":
+                return handlePortal(sender, args);
+            case "portals":
+                return handlePortals(sender, args);
+            case "exit_mode":
+                return handleExitMode(sender, args);
 	    default:
                 return false;
         }
     }
 
+    private boolean handleDm(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (args.length < 2) {
+            p.sendMessage("§7Usage: §e/dm <player> <message>");
+            return true;
+        }
 
-    // ---- Chat capture to Discord ----
+        String targetName = args[0];
+        Player online = Bukkit.getPlayerExact(targetName);
+        OfflinePlayer op = (online != null) ? online : Bukkit.getOfflinePlayer(targetName);
+
+        if (op == null || (op.getName() == null && !op.isOnline())) {
+            p.sendMessage("§cCould not find player '" + targetName + "'.");
+            return true;
+        }
+
+        UUID targetId = op.getUniqueId();
+        UUID fromId = p.getUniqueId();
+        if (fromId.equals(targetId)) {
+            p.sendMessage("§cYou cannot direct-message yourself.");
+            return true;
+        }
+
+        if (!friendManager.areFriends(fromId, targetId)) {
+            p.sendMessage("§cYou can only direct-message players who are your friends.");
+            return true;
+        }
+
+        String msg = String.join(" ", Arrays.copyOfRange(args, 1, args.length)).trim();
+        if (msg.isEmpty()) {
+            p.sendMessage("§7Your message was empty.");
+            return true;
+        }
+
+        sendDirectMessage(p, targetId, msg);
+        p.sendMessage("§7You are in direct-message mode with §e"
+                + (op.getName() != null ? op.getName() : targetName)
+                + "§7. Use §e/exit §7to go back to public chat.");
+        return true;
+    }
+
+    private boolean handleReply(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        UUID pId = p.getUniqueId();
+        UUID partner = lastDmPartner.get(pId);
+        if (partner == null) {
+            p.sendMessage("§7You have no one to reply to yet.");
+            return true;
+        }
+        if (args.length < 1) {
+            p.sendMessage("§7Usage: §e/reply <message>");
+            return true;
+        }
+
+        String msg = String.join(" ", args).trim();
+        if (msg.isEmpty()) {
+            p.sendMessage("§7Your message was empty.");
+            return true;
+        }
+
+        sendDirectMessage(p, partner, msg);
+        p.sendMessage("§7You are in direct-message mode with your last DM partner. Use §e/exit §7to go back to public chat.");
+        return true;
+    }
+
+    private boolean handleExitDm(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        UUID id = p.getUniqueId();
+        if (activeDmTarget.containsKey(id)) {
+            exitDmMode(p);
+            p.sendMessage("§7You have left direct-message mode. Chat is public again.");
+        } else {
+            p.sendMessage("§7You are not currently in direct-message mode.");
+        }
+        return true;
+    }
+
+    private boolean handleNotifyPing(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (friendManager == null) {
+            p.sendMessage("§cFriend system is not initialized yet.");
+            return true;
+        }
+
+        UUID id = p.getUniqueId();
+
+        if (args.length == 0) {
+            boolean enabled = friendManager.isPingEnabled(id);
+            p.sendMessage("§7Ping sounds are currently: " +
+                    (enabled ? "§aON" : "§cOFF"));
+            p.sendMessage("§7Use §e/notifyping on§7 or §e/notifyping off§7 to change.");
+            return true;
+        }
+
+        String sub = args[0].toLowerCase();
+        Boolean enable = null;
+        if (sub.equals("on") || sub.equals("enable") || sub.equals("enabled")) {
+            enable = Boolean.TRUE;
+        } else if (sub.equals("off") || sub.equals("disable") || sub.equals("disabled")) {
+            enable = Boolean.FALSE;
+        }
+
+        if (enable == null) {
+            p.sendMessage("§7Usage: §e/notifyping <on|off>");
+            return true;
+        }
+
+        friendManager.setPingEnabled(id, enable);
+        if (enable) {
+            p.sendMessage("§aPing sounds enabled. You will hear chimes on mentions and DMs.");
+        } else {
+            p.sendMessage("§cPing sounds disabled. You will no longer hear chimes on mentions or DMs.");
+        }
+
+        return true;
+    }
+
+    private boolean handleWorlds(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        WorldsGui.open(this, p);
+        return true;
+    }
+
+    private boolean handleWorld(CommandSender sender, String[] args) {
+        if (args.length == 0) {
+            sender.sendMessage("§7World commands:");
+            sender.sendMessage("§e/world create <name> <mode> <access> [icon] [seed...]");
+            sender.sendMessage("§e/world tp <name> [player]");
+            sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+            sender.sendMessage("§7  mode: §fdefault|flat|large (or 1/2/3)");
+            sender.sendMessage("§7  access: §fpublic|private");
+            return true;
+        }
+
+        String sub = args[0].toLowerCase();
+
+        switch (sub) {
+            case "create": {
+                if (!(sender instanceof Player p)) {
+                    sender.sendMessage("This command can only be used in-game.");
+                    return true;
+                }
+                if (!hasWorldAdmin(p)) {
+                    sender.sendMessage("§cYou are not allowed to create worlds.");
+                    return true;
+                }
+                if (args.length < 4) {
+                    sender.sendMessage("§7Usage: §e/world create <name> <mode> <access> [icon] [seed...]");
+                    return true;
+                }
+
+                String name = args[1];
+                String modeArg = args[2];
+                String accessArg = args[3];
+
+                WorldManager.Mode mode = WorldManager.Mode.fromStringOrId(modeArg);
+                WorldManager.Access access = WorldManager.Access.fromString(accessArg, WorldManager.Access.PUBLIC);
+
+                Material icon = Material.GRASS_BLOCK;
+                String seedText = null;
+
+                if (args.length >= 5) {
+                    String iconArg = args[4];
+                    Material m = Material.matchMaterial(iconArg);
+                    if (m != null) {
+                        icon = m;
+                    } else {
+                        sender.sendMessage("§cUnknown icon material '" + iconArg + "', using GRASS_BLOCK.");
+                    }
+                }
+
+                if (args.length >= 6) {
+                    seedText = String.join(" ", java.util.Arrays.copyOfRange(args, 5, args.length)).trim();
+                    if (seedText.isEmpty()) seedText = null;
+                }
+
+                WorldManager.WorldEntry entry = worldManager.createWorld(name, mode, access, icon, seedText);
+                World world = worldManager.ensureWorldLoaded(entry);
+                if (world == null) {
+                    sender.sendMessage("§cFailed to create/load world.");
+                    return true;
+                }
+
+                p.teleport(world.getSpawnLocation());
+                sender.sendMessage("§aCreated world §e" + entry.getName()
+                        + " §7(mode §f" + entry.getMode().name()
+                        + "§7, access "
+                        + (entry.getAccess() == WorldManager.Access.PUBLIC ? "§aPUBLIC" : "§cPRIVATE")
+                        + "§7).");
+                return true;
+            }
+
+            case "import": {
+                if (!(sender instanceof Player p)) {
+                    sender.sendMessage("This command can only be used in-game.");
+                    return true;
+                }
+                if (!hasWorldAdmin(p)) {
+                    sender.sendMessage("§cYou are not allowed to import worlds.");
+                    return true;
+                }
+                if (args.length < 2) {
+                    sender.sendMessage("§7Usage: §e/world import <folderName>");
+                    return true;
+                }
+
+                String folderName = args[1];
+                WorldManager.WorldEntry entry = worldManager.importWorld(folderName);
+
+                if (entry == null) {
+                    sender.sendMessage("§cFailed to import world folder §e" + folderName + "§c. Check console for details.");
+                    return true;
+                }
+
+                World world = worldManager.ensureWorldLoaded(entry);
+                if (world == null) {
+                    sender.sendMessage("§cWorld entry was created but the world could not be loaded.");
+                    return true;
+                }
+
+                p.teleport(world.getSpawnLocation());
+                sender.sendMessage("§aImported world folder §e" + folderName
+                        + "§a as world §e" + entry.getName()
+                        + "§a (default access: "
+                        + (entry.getAccess() == WorldManager.Access.PUBLIC ? "§aPUBLIC" : "§cPRIVATE")
+                        + "§a).");
+                return true;
+            }
+
+            case "tp": {
+                if (!(sender instanceof Player p)) {
+                    sender.sendMessage("This command can only be used in-game.");
+                    return true;
+                }
+                if (args.length < 2) {
+                    sender.sendMessage("§7Usage: §e/world tp <name> [player]");
+                    return true;
+                }
+
+                String worldName = args[1];
+                WorldManager.WorldEntry entry = worldManager.getWorldByName(worldName);
+                if (entry == null) {
+                    sender.sendMessage("§cUnknown world '" + worldName + "'.");
+                    return true;
+                }
+
+                Player target = p;
+                if (args.length >= 3) {
+                    if (!hasWorldAdmin(p)) {
+                        p.sendMessage("§cYou are not allowed to send other players to worlds.");
+                        return true;
+                    }
+                    String targetName = args[2];
+                    target = Bukkit.getPlayerExact(targetName);
+                    if (target == null) {
+                        p.sendMessage("§cPlayer not found: " + targetName);
+                        return true;
+                    }
+                }
+
+                // access check (always, regardless of who is executing)
+                boolean isAdmin = hasWorldAdmin(target);
+                if (entry.getAccess() == WorldManager.Access.PRIVATE && !isAdmin) {
+                    p.sendMessage("§cThat world is private, and the target is not allowed to access it.");
+                    return true;
+                }
+
+                World world = worldManager.ensureWorldLoaded(entry);
+                if (world == null) {
+                    sender.sendMessage("§cFailed to load world.");
+                    return true;
+                }
+
+                org.bukkit.Location loc = world.getSpawnLocation();
+
+                // same motion-sickness-friendly teleport as in WarpsGuiListener
+                target.addPotionEffect(new org.bukkit.potion.PotionEffect(
+                        org.bukkit.potion.PotionEffectType.BLINDNESS,
+                        25,
+                        1,
+                        false,
+                        false,
+                        false
+                ));
+                target.playSound(
+                        target.getLocation(),
+                        org.bukkit.Sound.ENTITY_ENDERMAN_TELEPORT,
+                        1.0f,
+                        1.0f
+                );
+                final Player finalTarget = target;
+                getServer().getScheduler().runTaskLater(
+                        this,
+                        () -> {
+                            finalTarget.teleport(loc);
+                            finalTarget.sendMessage("§aSwitched to world §e" + entry.getName() + "§a.");
+                        },
+                        3L
+                );
+
+                if (target != p) {
+                    p.sendMessage("§aSent §e" + target.getName() + " §ato world §e" + entry.getName() + "§a.");
+                }
+                return true;
+            }
+
+            case "edit": {
+                if (!(sender instanceof Player p)) {
+                    sender.sendMessage("This command can only be used in-game.");
+                    return true;
+                }
+                if (!hasWorldAdmin(p)) {
+                    sender.sendMessage("§cYou are not allowed to edit worlds.");
+                    return true;
+                }
+                if (args.length < 3) {
+                    sender.sendMessage("§7Usage: §e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+                    return true;
+                }
+
+                String worldName = args[1];
+                WorldManager.WorldEntry entry = worldManager.getWorldByName(worldName);
+                if (entry == null) {
+                    sender.sendMessage("§cUnknown world '" + worldName + "'.");
+                    return true;
+                }
+
+                String action = args[2].toLowerCase();
+
+                switch (action) {
+                    case "rename": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " rename <newName>");
+                            return true;
+                        }
+                        String newName = args[3];
+                        if (newName.length() > 32) {
+                            sender.sendMessage("§cNew world name is too long (max 32 characters).");
+                            return true;
+                        }
+
+                        WorldManager.WorldEntry conflict = worldManager.getWorldByName(newName);
+                        if (conflict != null && conflict != entry) {
+                            sender.sendMessage("§cAnother world with that name already exists.");
+                            return true;
+                        }
+
+                        worldManager.renameWorld(entry, newName);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aWorld renamed to §e" + newName + "§a.");
+                        return true;
+                    }
+
+                    case "access": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " access <public|private>");
+                            return true;
+                        }
+                        String accessArg = args[3].toLowerCase();
+                        WorldManager.Access access;
+                        if (accessArg.startsWith("pub")) {
+                            access = WorldManager.Access.PUBLIC;
+                        } else if (accessArg.startsWith("pri")) {
+                            access = WorldManager.Access.PRIVATE;
+                        } else {
+                            sender.sendMessage("§cAccess must be either 'public' or 'private'.");
+                            return true;
+                        }
+
+                        worldManager.setWorldAccess(entry, access);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aWorld §e" + entry.getName() + " §aaccess set to "
+                                + (access == WorldManager.Access.PUBLIC ? "§aPUBLIC" : "§cPRIVATE") + "§a.");
+                        return true;
+                    }
+
+                    case "icon": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " icon <material>");
+                            return true;
+                        }
+                        String matName = args[3];
+                        Material mat = Material.matchMaterial(matName);
+                        if (mat == null) {
+                            sender.sendMessage("§cUnknown material: §f" + matName);
+                            return true;
+                        }
+                        if (!mat.isItem()) {
+                            sender.sendMessage("§c" + mat.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
+                            sender.sendMessage("§7Use an actual item like §eGRASS_BLOCK§7, §eSTONE§7, etc.");
+                            return true;
+                        }
+
+                        worldManager.updateWorldIcon(entry, mat);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aUpdated icon for world §e" + entry.getName() + "§a.");
+                        return true;
+                    }
+
+                    case "order": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " order <number>");
+                            return true;
+                        }
+                        int order;
+                        try {
+                            order = Integer.parseInt(args[3]);
+                        } catch (NumberFormatException ex) {
+                            sender.sendMessage("§cOrder must be an integer.");
+                            return true;
+                        }
+                        if (order < 0) order = 0;
+
+                        worldManager.updateWorldOrder(entry, order);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aUpdated GUI order for world §e" + entry.getName()
+                                + "§a to §e" + order + "§a.");
+                        return true;
+                    }
+
+                    case "delete": {
+                        if (!worldManager.canDelete(entry)) {
+                            sender.sendMessage("§cThis world cannot be deleted (likely a default/vanilla world).");
+                            return true;
+                        }
+
+                        worldManager.deleteWorld(entry);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§cDeleted world entry §e" + worldName + "§c.");
+                        return true;
+                    }
+
+                    case "inv": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " inv <shared|separate>");
+                            return true;
+                        }
+                        String modeArg = args[3].toLowerCase();
+                        Boolean separate = null;
+                        if (modeArg.startsWith("share")) {
+                            separate = Boolean.FALSE;
+                        } else if (modeArg.startsWith("sep")) {
+                            separate = Boolean.TRUE;
+                        }
+                        if (separate == null) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " inv <shared|separate>");
+                            return true;
+                        }
+
+                        entry.setSeparateInventory(separate);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aInventory mode for world §e" + entry.getName() + "§a set to "
+                                + (separate ? "§cSEPARATE" : "§aSHARED") + "§a.");
+                        return true;
+                    }
+
+                    case "stats": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " stats <shared|separate>");
+                            return true;
+                        }
+                        String modeArg = args[3].toLowerCase();
+                        Boolean separate = null;
+                        if (modeArg.startsWith("share")) {
+                            separate = Boolean.FALSE;
+                        } else if (modeArg.startsWith("sep")) {
+                            separate = Boolean.TRUE;
+                        }
+                        if (separate == null) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " stats <shared|separate>");
+                            return true;
+                        }
+
+                        entry.setSeparateStats(separate);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aStats mode for world §e" + entry.getName() + "§a set to "
+                                + (separate ? "§cSEPARATE" : "§aSHARED") + "§a.");
+                        return true;
+                    }
+
+                    case "reset": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " reset <health|hunger|both|off>");
+                            return true;
+                        }
+                        String what = args[3].toLowerCase();
+                        boolean resetHealth, resetHunger;
+
+                        switch (what) {
+                            case "health" -> {
+                                resetHealth = true;
+                                resetHunger = false;
+                            }
+                            case "hunger" -> {
+                                resetHealth = false;
+                                resetHunger = true;
+                            }
+                            case "both" -> {
+                                resetHealth = true;
+                                resetHunger = true;
+                            }
+                            case "off" -> {
+                                resetHealth = false;
+                                resetHunger = false;
+                            }
+                            default -> {
+                                sender.sendMessage("§7Usage: §e/world edit " + worldName + " reset <health|hunger|both|off>");
+                                return true;
+                            }
+                        }
+
+                        entry.setResetHealthOnEnter(resetHealth);
+                        entry.setResetHungerOnEnter(resetHunger);
+                        worldManager.saveSafely();
+
+                        String desc;
+                        if (!resetHealth && !resetHunger) {
+                            desc = "§7no automatic stat resets";
+                        } else if (resetHealth && resetHunger) {
+                            desc = "§areset HEALTH and HUNGER on enter";
+                        } else if (resetHealth) {
+                            desc = "§areset HEALTH on enter";
+                        } else {
+                            desc = "§areset HUNGER on enter";
+                        }
+
+                        sender.sendMessage("§aWorld §e" + entry.getName() + "§a now uses: " + desc + "§a.");
+                        return true;
+                    }
+
+                    case "gamemode": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " gamemode <survival|creative|adventure|spectator|inherit>");
+                            return true;
+                        }
+                        String gmArg = args[3].toLowerCase();
+                        org.bukkit.GameMode gm = null;
+
+                        if (gmArg.startsWith("surv")) {
+                            gm = org.bukkit.GameMode.SURVIVAL;
+                        } else if (gmArg.startsWith("creat")) {
+                            gm = org.bukkit.GameMode.CREATIVE;
+                        } else if (gmArg.startsWith("adven")) {
+                            gm = org.bukkit.GameMode.ADVENTURE;
+                        } else if (gmArg.startsWith("spect")) {
+                            gm = org.bukkit.GameMode.SPECTATOR;
+                        } else if (gmArg.startsWith("inherit")) {
+                            gm = null; // inherit
+                        } else {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " gamemode <survival|creative|adventure|spectator|inherit>");
+                            return true;
+                        }
+
+                        entry.setDefaultGamemode(gm);
+                        worldManager.saveSafely();
+
+                        String label = (gm == null ? "§7INHERIT server default" : "§e" + gm.name());
+                        sender.sendMessage("§aDefault gamemode for world §e" + entry.getName() + "§a set to " + label + "§a.");
+                        return true;
+                    }
+
+                    default: {
+                        sender.sendMessage("§7Usage: §e/world edit " + worldName
+                                + " <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+                        return true;
+                    }
+                }
+            }
+
+            default: {
+                sender.sendMessage("§7World commands:");
+                sender.sendMessage("§e/world create <name> <mode> <access> [icon] [seed...]");
+                sender.sendMessage("§e/world tp <name> [player]");
+                sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+                return true;
+            }
+        }
+    }
+
+    private boolean handlePortal(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (portalManager == null) {
+            p.sendMessage("§cPortal system is not initialized.");
+            return true;
+        }
+
+        // Only Discord-staff (is_staff) may manage portals
+        String key = p.getUniqueId().toString().replace("-", "");
+        PlayerStyle style = playerStyles.get(key);
+        if (style == null || !style.isStaff) {
+            p.sendMessage("§cYou are not allowed to manage portals.");
+            return true;
+        }
+
+        if (args.length == 0) {
+            p.sendMessage("§7Portal commands:");
+            p.sendMessage("§e/portal wand §7- get portal wand");
+            p.sendMessage("§e/portal create <name> <world-or-warp> §7- create portal from selection");
+            p.sendMessage("§e/portal rebuild §7- enter portal rebuild mode");
+            p.sendMessage("§e/exit_mode §7- exit portal rebuild mode");
+            p.sendMessage("§e/portals list §7- list portals");
+            p.sendMessage("§e/portals edit <name> <activate|deactivate|changetarget|changearea|delete> [...]");
+            return true;
+        }
+
+        String sub = args[0].toLowerCase(Locale.ROOT);
+
+	switch (sub) {
+            case "wand" -> {
+                if (!hasWorldAdmin(p)) {
+                    p.sendMessage("§cYou are not allowed to manage portals.");
+                    return true;
+                }
+                portalManager.giveWand(p);
+                portalManager.clearSelection(p);
+                return true;
+            }
+            case "create" -> {
+                if (!hasWorldAdmin(p)) {
+                    p.sendMessage("§cYou are not allowed to create portals.");
+                    return true;
+                }
+                if (args.length < 3) {
+                    p.sendMessage("§7Usage: §e/portal create <name> <world-or-warp>");
+                    return true;
+                }
+                String portalName = args[1];
+                String target = args[2];
+                PortalManager.PortalEntry entry =
+                        portalManager.createPortalFromSelection(p, portalName, target);
+                // errors are already messaged from inside; nothing else to do
+                return true;
+            }
+            case "rebuild" -> {
+                if (!hasWorldAdmin(p)) {
+                    p.sendMessage("§cYou are not allowed to rebuild portals.");
+                    return true;
+                }
+                portalManager.enableRebuildMode(p);
+                portalManager.giveWand(p);
+                return true;
+            }
+            default -> {
+                p.sendMessage("§cUnknown subcommand. Use §e/portal§c for help.");
+                return true;
+            }
+        }
+    }
+
+    private boolean handlePortals(CommandSender sender, String[] args) {
+        if (portalManager == null) {
+            sender.sendMessage("§cPortal system is not initialized.");
+            return true;
+        }
+
+        boolean isStaff;
+        if (sender instanceof Player p) {
+            String key = p.getUniqueId().toString().replace("-", "");
+            PlayerStyle style = playerStyles.get(key);
+            if (style == null || !style.isStaff) {
+                p.sendMessage("§cYou are not allowed to manage portals.");
+                return true;
+            }
+            isStaff = true;
+        } else {
+            // console: always allowed
+            isStaff = true;
+        }
+
+        if (args.length == 0 || args[0].equalsIgnoreCase("list")) {
+            java.util.List<PortalManager.PortalEntry> list = portalManager.getAllPortalsSorted();
+            if (list.isEmpty()) {
+                sender.sendMessage("§7No portals defined.");
+                return true;
+            }
+
+            sender.sendMessage("§7Portals:");
+            for (PortalManager.PortalEntry e : list) {
+                if (!isStaff && !e.isActive()) {
+                    continue; // hide inactive portals from non-staff
+                }
+                String status = e.isActive() ? "§aACTIVE" : "§cINACTIVE";
+                sender.sendMessage("  §e" + e.getName() + "§7 -> "
+                        + (e.getTargetType() == PortalManager.TargetType.WORLD ? "world " : "warp ")
+                        + "§f" + e.getTargetName()
+                        + " §7[" + status + "§7]"
+                        + " in §f" + e.getWorldName());
+            }
+            return true;
+        }
+
+        if (!args[0].equalsIgnoreCase("edit")) {
+            sender.sendMessage("§7Usage: §e/portals list §7or §e/portals edit <name> <...>");
+            return true;
+        }
+
+        if (args.length < 3) {
+            sender.sendMessage("§7Usage: §e/portals edit <name> <activate|deactivate|changetarget|changearea|delete> [...]");
+            return true;
+        }
+
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("Only players may edit portals.");
+            return true;
+        }
+        if (!hasWorldAdmin(p)) {
+            p.sendMessage("§cYou are not allowed to edit portals.");
+            return true;
+        }
+
+        String portalName = args[1];
+        String action = args[2].toLowerCase(Locale.ROOT);
+
+        PortalManager.PortalEntry entry = portalManager.getPortalByName(portalName);
+        if (entry == null) {
+            p.sendMessage("§cNo portal named §e" + portalName + "§c found.");
+            return true;
+        }
+
+        switch (action) {
+            case "activate" -> {
+                portalManager.setPortalActive(entry, true);
+                p.sendMessage("§aPortal §e" + entry.getName() + "§a activated.");
+                return true;
+            }
+            case "deactivate" -> {
+                portalManager.setPortalActive(entry, false);
+                p.sendMessage("§aPortal §e" + entry.getName() + "§a deactivated.");
+                return true;
+            }
+            case "changetarget" -> {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/portals edit " + portalName + " changetarget <world-or-warp>");
+                    return true;
+                }
+                String newTarget = args[3];
+                portalManager.updatePortalTarget(p, entry, newTarget);
+                return true;
+            }
+            case "changearea" -> {
+                portalManager.changePortalAreaFromSelection(p, entry);
+                return true;
+            }
+            case "delete" -> {
+                portalManager.deletePortal(entry);
+                p.sendMessage("§cDeleted portal §e" + portalName + "§c and cleared its blocks.");
+                return true;
+            }
+            default -> {
+                p.sendMessage("§7Usage: §e/portals edit " + portalName
+                        + " <activate|deactivate|changetarget|changearea|delete> [...]");
+                return true;
+            }
+        }
+    }
+
+    private boolean handleExitMode(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (portalManager == null) {
+            p.sendMessage("§cPortal system is not initialized.");
+            return true;
+        }
+        if (!portalManager.isInRebuildMode(p)) {
+            p.sendMessage("§7You are not currently in portal rebuild mode.");
+            return true;
+        }
+        portalManager.disableRebuildMode(p);
+        return true;
+    }
+
+    // ---- Chat capture to Discord + DM routing + @Name ping ----
 
     @EventHandler
     public void onChat(AsyncChatEvent e) {
@@ -1513,20 +3400,14 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
 
         final Player player = e.getPlayer();
         final String playerName = player.getName();
-        final String uuid = player.getUniqueId().toString().replace("-", "");
+        final UUID playerUuid = player.getUniqueId();
+        final String uuidStr = playerUuid.toString().replace("-", "");
 
-        // Raw plain text as the player typed it (e.message() is an Adventure Component)
         final String rawText = PlainTextComponentSerializer.plainText()
                 .serialize(e.message());
 
-        // ---- NEW: convert MC formatting -> Discord markdown (drop colors) ----
-        final String discordFormatted = MarkdownUtil.minecraftToDiscord(rawText);
-
-        // Text escaped for JSON payload to Discord
-        final String text = escape(discordFormatted);
-
         // Check for active mute
-        MuteEntry mute = mutes.get(uuid);
+        MuteEntry mute = mutes.get(uuidStr);
         if (mute != null && mute.isActive()) {
             e.setCancelled(true);
 
@@ -1548,10 +3429,25 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
             return;
         }
 
-        // Send to Discord (now using markdown-formatted text)
+        // DM mode: if active and not a command, treat as DM
+        UUID dmTarget = activeDmTarget.get(playerUuid);
+        if (dmTarget != null && !rawText.startsWith("/")) {
+            e.setCancelled(true);
+            String msg = rawText.trim();
+            if (!msg.isEmpty()) {
+                Bukkit.getScheduler().runTask(this,
+                        () -> sendDirectMessage(player, dmTarget, msg));
+            }
+            return;
+        }
+
+        // Normal public chat → Discord bridge
+        final String discordFormatted = MarkdownUtil.minecraftToDiscord(rawText);
+        final String text = escape(discordFormatted);
+
         if (ws != null) {
             final String payload = "{\"op\":\"mc_chat\",\"player\":\"" + playerName + "\","
-                    + "\"uuid\":\"" + uuid + "\","
+                    + "\"uuid\":\"" + uuidStr + "\","
                     + "\"text\":\"" + text + "\"}";
             try {
                 ws.sendText(payload, true);
@@ -1559,24 +3455,42 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener {
             }
         }
 
-        // Look up style for this player
-        PlayerStyle style = playerStyles.get(uuid);
+        PlayerStyle style = playerStyles.get(uuidStr);
         String prefix = (style != null && style.prefix != null && !style.prefix.isEmpty())
                 ? style.prefix + " "
                 : "";
         String colorCode = (style != null) ? hexToMinecraftColor(style.colorHex) : "§f";
 
-        // ---- NEW: apply &-codes inside the message for in-game display ----
-        // Example: "&l&2Test&r Lol" becomes colored/bold in MC
         final String coloredMessage =
-            MinecraftFormatUtil.applyPersistentFormatting(rawText);
+                MinecraftFormatUtil.applyPersistentFormatting(rawText);
 
         final String finalMsg = colorCode + prefix + "§l" + playerName + "§r: " + coloredMessage;
 
-        // Override default chat formatting
         e.setCancelled(true);
-        Bukkit.getScheduler().runTask(this,
-                () -> Bukkit.broadcastMessage(finalMsg));
+        Bukkit.getScheduler().runTask(this, () -> {
+            Bukkit.broadcastMessage(finalMsg);
+            // MC -> MC @Name ping
+            pingMentionedPlayers(rawText, playerName);
+        });
+    }
+
+    private void pingMentionedPlayers(String rawText, String senderName) {
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("@([A-Za-z0-9_]{3,16})")
+                .matcher(rawText);
+
+        while (m.find()) {
+            String name = m.group(1);
+            if (name.equalsIgnoreCase(senderName)) continue;
+            String key = name.toLowerCase();
+            if (!seen.add(key)) continue;
+
+            Player target = Bukkit.getPlayerExact(name);
+            if (target != null && target.isOnline()) {
+                notifyPing(target.getName());
+            }
+        }
     }
 
     private static String escape(String s) {

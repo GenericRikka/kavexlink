@@ -16,12 +16,11 @@ dependencies {
 
 java {
     toolchain {
-        languageVersion.set(JavaLanguageVersion.of(21)) // Paper 1.21.x requires Java 17+
+        languageVersion.set(JavaLanguageVersion.of(21)) 
     }
 }
 
 tasks.processResources {
-    // expand version into plugin.yml if desired
     filesMatching("plugin.yml") {
         expand("version" to project.version)
     }
