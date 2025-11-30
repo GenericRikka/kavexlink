@@ -101,11 +101,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
 
     private FriendManager friendManager;
     private WarpManager warpManager;
-    private WorldManager worldManager;
     private NamespacedKey warpKey;
     private NamespacedKey worldKey;
-    private PortalManager portalManager;
-    private WorldProfileManager worldProfileManager;
 
 
     private static class PlayerStyle {
@@ -188,24 +185,12 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         return warpManager;
     }
 
-    public WorldManager getWorldManager() {
-        return worldManager;
-    }
-
     public NamespacedKey getWarpKey() {
         return warpKey;
     }
 
     public NamespacedKey getWorldKey() {
         return worldKey;
-    }
-
-    public PortalManager getPortalManager() {
-        return portalManager;
-    }
-
-    public WorldProfileManager getWorldProfileManager() {
-        return worldProfileManager;
     }
 
 
@@ -255,19 +240,13 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
 
         // Warps & Worlds
         this.warpManager = new WarpManager(this);
-        this.worldManager = new WorldManager(this);
 
         this.warpKey = new NamespacedKey(this, "warp_id");
         this.worldKey = new NamespacedKey(this, "world_id");
 
-	this.portalManager = new PortalManager(this);
-        getServer().getPluginManager().registerEvents(portalManager, this);
-
-	this.worldProfileManager = new WorldProfileManager(this);
 
         // Listeners for GUIs
         getServer().getPluginManager().registerEvents(new WarpsGuiListener(this), this);
-        getServer().getPluginManager().registerEvents(new WorldsGuiListener(this), this);
 
         // Moderation storage
         this.moderationFile = dataDir.resolve("moderation.yml").toFile();
@@ -422,9 +401,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         if (warpManager != null) {
             warpManager.save();
         }
-        if (worldManager != null) {
-            worldManager.saveSafely();
-	}
 
         // Clean up bossbars
         for (BossBar bar : dmBossBars.values()) {
@@ -438,9 +414,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         WebSocket ws = socketRef.getAndSet(null);
         if (ws != null) ws.abort();
     
-	if (portalManager != null) {
-            portalManager.saveSafely();
-        }
     }
 
     private void updateTabListName(Player p) {
@@ -525,13 +498,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         UUID pid = p.getUniqueId();
         activeDmTarget.remove(pid);
         hideDmBossBar(p);
-    }
-
-    public void applyWorldGamemode(Player p, WorldManager.WorldEntry entry) {
-        if (entry == null) return;
-        GameMode gm = entry.getDefaultGamemode();
-        if (gm == null) return; // inherit server default
-        p.setGameMode(gm);
     }
 
     // ----------------- DM core helpers -----------------
@@ -1241,9 +1207,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         if (!(sender instanceof Player)) {
             return Collections.emptyList();
         }
-        if (portalManager == null) {
-            return Collections.emptyList();
-        }
 
         if (args.length == 1) {
             String partial = args[0].toLowerCase(Locale.ROOT);
@@ -1275,10 +1238,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
     }
 
     private List<String> tabCompletePortals(CommandSender sender, String[] args) {
-        if (portalManager == null) {
-            return Collections.emptyList();
-        }
-
         if (args.length == 1) {
             String partial = args[0].toLowerCase(Locale.ROOT);
             List<String> subs = new ArrayList<>();
@@ -1295,12 +1254,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 // portal name
                 String partial = args[1].toLowerCase(Locale.ROOT);
                 List<String> names = new ArrayList<>();
-                for (PortalManager.PortalEntry e : portalManager.getAllPortalsSorted()) {
-                    String n = e.getName();
-                    if (n.toLowerCase(Locale.ROOT).startsWith(partial)) {
-                        names.add(n);
-                    }
-                }
                 Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
                 return names;
             }
@@ -2044,11 +1997,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         requestPermStyle(p);
         updateTabListName(p);
 
-        // NEW: apply per-world profile on first join
-        if (worldProfileManager != null) {
-            worldProfileManager.handleJoin(p);
-        }
-
         UUID uuid = p.getUniqueId();
         for (String msg : friendManager.drainNotifications(uuid)) {
             p.sendMessage(msg);
@@ -2130,11 +2078,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         Player p = e.getPlayer();
         String from = e.getFrom().getName();
         String to = p.getWorld().getName();
-
-        // NEW: switch per-world profile
-        if (worldProfileManager != null) {
-            worldProfileManager.handleWorldChange(p, e.getFrom(), p.getWorld());
-        }
 
         String text = "switched from world \"" + from + "\" to \"" + to + "\"";
         sendEvent("world_change", p, text);
@@ -2586,14 +2529,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 return handleWarps(sender, args);
             case "warp":
                 return handleWarpEdit(sender, args);
-            case "worlds":
-                return handleWorlds(sender, args);
-            case "world":
-                return handleWorld(sender, args);
-            case "portal":
-                return handlePortal(sender, args);
-            case "portals":
-                return handlePortals(sender, args);
             case "exit_mode":
                 return handleExitMode(sender, args);
 	    default:
@@ -2730,665 +2665,12 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         return true;
     }
 
-    private boolean handleWorlds(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player p)) {
-            sender.sendMessage("This command can only be used in-game.");
-            return true;
-        }
-        WorldsGui.open(this, p);
-        return true;
-    }
-
-    private boolean handleWorld(CommandSender sender, String[] args) {
-        if (args.length == 0) {
-            sender.sendMessage("§7World commands:");
-            sender.sendMessage("§e/world create <name> <mode> <access> [icon] [seed...]");
-            sender.sendMessage("§e/world tp <name> [player]");
-            sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
-            sender.sendMessage("§7  mode: §fdefault|flat|large (or 1/2/3)");
-            sender.sendMessage("§7  access: §fpublic|private");
-            return true;
-        }
-
-        String sub = args[0].toLowerCase();
-
-        switch (sub) {
-            case "create": {
-                if (!(sender instanceof Player p)) {
-                    sender.sendMessage("This command can only be used in-game.");
-                    return true;
-                }
-                if (!hasWorldAdmin(p)) {
-                    sender.sendMessage("§cYou are not allowed to create worlds.");
-                    return true;
-                }
-                if (args.length < 4) {
-                    sender.sendMessage("§7Usage: §e/world create <name> <mode> <access> [icon] [seed...]");
-                    return true;
-                }
-
-                String name = args[1];
-                String modeArg = args[2];
-                String accessArg = args[3];
-
-                WorldManager.Mode mode = WorldManager.Mode.fromStringOrId(modeArg);
-                WorldManager.Access access = WorldManager.Access.fromString(accessArg, WorldManager.Access.PUBLIC);
-
-                Material icon = Material.GRASS_BLOCK;
-                String seedText = null;
-
-                if (args.length >= 5) {
-                    String iconArg = args[4];
-                    Material m = Material.matchMaterial(iconArg);
-                    if (m != null) {
-                        icon = m;
-                    } else {
-                        sender.sendMessage("§cUnknown icon material '" + iconArg + "', using GRASS_BLOCK.");
-                    }
-                }
-
-                if (args.length >= 6) {
-                    seedText = String.join(" ", java.util.Arrays.copyOfRange(args, 5, args.length)).trim();
-                    if (seedText.isEmpty()) seedText = null;
-                }
-
-                WorldManager.WorldEntry entry = worldManager.createWorld(name, mode, access, icon, seedText);
-                World world = worldManager.ensureWorldLoaded(entry);
-                if (world == null) {
-                    sender.sendMessage("§cFailed to create/load world.");
-                    return true;
-                }
-
-                p.teleport(world.getSpawnLocation());
-                sender.sendMessage("§aCreated world §e" + entry.getName()
-                        + " §7(mode §f" + entry.getMode().name()
-                        + "§7, access "
-                        + (entry.getAccess() == WorldManager.Access.PUBLIC ? "§aPUBLIC" : "§cPRIVATE")
-                        + "§7).");
-                return true;
-            }
-
-            case "import": {
-                if (!(sender instanceof Player p)) {
-                    sender.sendMessage("This command can only be used in-game.");
-                    return true;
-                }
-                if (!hasWorldAdmin(p)) {
-                    sender.sendMessage("§cYou are not allowed to import worlds.");
-                    return true;
-                }
-                if (args.length < 2) {
-                    sender.sendMessage("§7Usage: §e/world import <folderName>");
-                    return true;
-                }
-
-                String folderName = args[1];
-                WorldManager.WorldEntry entry = worldManager.importWorld(folderName);
-
-                if (entry == null) {
-                    sender.sendMessage("§cFailed to import world folder §e" + folderName + "§c. Check console for details.");
-                    return true;
-                }
-
-                World world = worldManager.ensureWorldLoaded(entry);
-                if (world == null) {
-                    sender.sendMessage("§cWorld entry was created but the world could not be loaded.");
-                    return true;
-                }
-
-                p.teleport(world.getSpawnLocation());
-                sender.sendMessage("§aImported world folder §e" + folderName
-                        + "§a as world §e" + entry.getName()
-                        + "§a (default access: "
-                        + (entry.getAccess() == WorldManager.Access.PUBLIC ? "§aPUBLIC" : "§cPRIVATE")
-                        + "§a).");
-                return true;
-            }
-
-            case "tp": {
-                if (!(sender instanceof Player p)) {
-                    sender.sendMessage("This command can only be used in-game.");
-                    return true;
-                }
-                if (args.length < 2) {
-                    sender.sendMessage("§7Usage: §e/world tp <name> [player]");
-                    return true;
-                }
-
-                String worldName = args[1];
-                WorldManager.WorldEntry entry = worldManager.getWorldByName(worldName);
-                if (entry == null) {
-                    sender.sendMessage("§cUnknown world '" + worldName + "'.");
-                    return true;
-                }
-
-                Player target = p;
-                if (args.length >= 3) {
-                    if (!hasWorldAdmin(p)) {
-                        p.sendMessage("§cYou are not allowed to send other players to worlds.");
-                        return true;
-                    }
-                    String targetName = args[2];
-                    target = Bukkit.getPlayerExact(targetName);
-                    if (target == null) {
-                        p.sendMessage("§cPlayer not found: " + targetName);
-                        return true;
-                    }
-                }
-
-                // access check (always, regardless of who is executing)
-                boolean isAdmin = hasWorldAdmin(target);
-                if (entry.getAccess() == WorldManager.Access.PRIVATE && !isAdmin) {
-                    p.sendMessage("§cThat world is private, and the target is not allowed to access it.");
-                    return true;
-                }
-
-                World world = worldManager.ensureWorldLoaded(entry);
-                if (world == null) {
-                    sender.sendMessage("§cFailed to load world.");
-                    return true;
-                }
-
-                org.bukkit.Location loc = world.getSpawnLocation();
-
-                // same motion-sickness-friendly teleport as in WarpsGuiListener
-                target.addPotionEffect(new org.bukkit.potion.PotionEffect(
-                        org.bukkit.potion.PotionEffectType.BLINDNESS,
-                        25,
-                        1,
-                        false,
-                        false,
-                        false
-                ));
-                target.playSound(
-                        target.getLocation(),
-                        org.bukkit.Sound.ENTITY_ENDERMAN_TELEPORT,
-                        1.0f,
-                        1.0f
-                );
-                final Player finalTarget = target;
-                getServer().getScheduler().runTaskLater(
-                        this,
-                        () -> {
-                            finalTarget.teleport(loc);
-                            finalTarget.sendMessage("§aSwitched to world §e" + entry.getName() + "§a.");
-                        },
-                        3L
-                );
-
-                if (target != p) {
-                    p.sendMessage("§aSent §e" + target.getName() + " §ato world §e" + entry.getName() + "§a.");
-                }
-                return true;
-            }
-
-            case "edit": {
-                if (!(sender instanceof Player p)) {
-                    sender.sendMessage("This command can only be used in-game.");
-                    return true;
-                }
-                if (!hasWorldAdmin(p)) {
-                    sender.sendMessage("§cYou are not allowed to edit worlds.");
-                    return true;
-                }
-                if (args.length < 3) {
-                    sender.sendMessage("§7Usage: §e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
-                    return true;
-                }
-
-                String worldName = args[1];
-                WorldManager.WorldEntry entry = worldManager.getWorldByName(worldName);
-                if (entry == null) {
-                    sender.sendMessage("§cUnknown world '" + worldName + "'.");
-                    return true;
-                }
-
-                String action = args[2].toLowerCase();
-
-                switch (action) {
-                    case "rename": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " rename <newName>");
-                            return true;
-                        }
-                        String newName = args[3];
-                        if (newName.length() > 32) {
-                            sender.sendMessage("§cNew world name is too long (max 32 characters).");
-                            return true;
-                        }
-
-                        WorldManager.WorldEntry conflict = worldManager.getWorldByName(newName);
-                        if (conflict != null && conflict != entry) {
-                            sender.sendMessage("§cAnother world with that name already exists.");
-                            return true;
-                        }
-
-                        worldManager.renameWorld(entry, newName);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§aWorld renamed to §e" + newName + "§a.");
-                        return true;
-                    }
-
-                    case "access": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " access <public|private>");
-                            return true;
-                        }
-                        String accessArg = args[3].toLowerCase();
-                        WorldManager.Access access;
-                        if (accessArg.startsWith("pub")) {
-                            access = WorldManager.Access.PUBLIC;
-                        } else if (accessArg.startsWith("pri")) {
-                            access = WorldManager.Access.PRIVATE;
-                        } else {
-                            sender.sendMessage("§cAccess must be either 'public' or 'private'.");
-                            return true;
-                        }
-
-                        worldManager.setWorldAccess(entry, access);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§aWorld §e" + entry.getName() + " §aaccess set to "
-                                + (access == WorldManager.Access.PUBLIC ? "§aPUBLIC" : "§cPRIVATE") + "§a.");
-                        return true;
-                    }
-
-                    case "icon": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " icon <material>");
-                            return true;
-                        }
-                        String matName = args[3];
-                        Material mat = Material.matchMaterial(matName);
-                        if (mat == null) {
-                            sender.sendMessage("§cUnknown material: §f" + matName);
-                            return true;
-                        }
-                        if (!mat.isItem()) {
-                            sender.sendMessage("§c" + mat.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
-                            sender.sendMessage("§7Use an actual item like §eGRASS_BLOCK§7, §eSTONE§7, etc.");
-                            return true;
-                        }
-
-                        worldManager.updateWorldIcon(entry, mat);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§aUpdated icon for world §e" + entry.getName() + "§a.");
-                        return true;
-                    }
-
-                    case "order": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " order <number>");
-                            return true;
-                        }
-                        int order;
-                        try {
-                            order = Integer.parseInt(args[3]);
-                        } catch (NumberFormatException ex) {
-                            sender.sendMessage("§cOrder must be an integer.");
-                            return true;
-                        }
-                        if (order < 0) order = 0;
-
-                        worldManager.updateWorldOrder(entry, order);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§aUpdated GUI order for world §e" + entry.getName()
-                                + "§a to §e" + order + "§a.");
-                        return true;
-                    }
-
-                    case "delete": {
-                        if (!worldManager.canDelete(entry)) {
-                            sender.sendMessage("§cThis world cannot be deleted (likely a default/vanilla world).");
-                            return true;
-                        }
-
-                        worldManager.deleteWorld(entry);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§cDeleted world entry §e" + worldName + "§c.");
-                        return true;
-                    }
-
-                    case "inv": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " inv <shared|separate>");
-                            return true;
-                        }
-                        String modeArg = args[3].toLowerCase();
-                        Boolean separate = null;
-                        if (modeArg.startsWith("share")) {
-                            separate = Boolean.FALSE;
-                        } else if (modeArg.startsWith("sep")) {
-                            separate = Boolean.TRUE;
-                        }
-                        if (separate == null) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " inv <shared|separate>");
-                            return true;
-                        }
-
-                        entry.setSeparateInventory(separate);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§aInventory mode for world §e" + entry.getName() + "§a set to "
-                                + (separate ? "§cSEPARATE" : "§aSHARED") + "§a.");
-                        return true;
-                    }
-
-                    case "stats": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " stats <shared|separate>");
-                            return true;
-                        }
-                        String modeArg = args[3].toLowerCase();
-                        Boolean separate = null;
-                        if (modeArg.startsWith("share")) {
-                            separate = Boolean.FALSE;
-                        } else if (modeArg.startsWith("sep")) {
-                            separate = Boolean.TRUE;
-                        }
-                        if (separate == null) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " stats <shared|separate>");
-                            return true;
-                        }
-
-                        entry.setSeparateStats(separate);
-                        worldManager.saveSafely();
-                        sender.sendMessage("§aStats mode for world §e" + entry.getName() + "§a set to "
-                                + (separate ? "§cSEPARATE" : "§aSHARED") + "§a.");
-                        return true;
-                    }
-
-                    case "reset": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " reset <health|hunger|both|off>");
-                            return true;
-                        }
-                        String what = args[3].toLowerCase();
-                        boolean resetHealth, resetHunger;
-
-                        switch (what) {
-                            case "health" -> {
-                                resetHealth = true;
-                                resetHunger = false;
-                            }
-                            case "hunger" -> {
-                                resetHealth = false;
-                                resetHunger = true;
-                            }
-                            case "both" -> {
-                                resetHealth = true;
-                                resetHunger = true;
-                            }
-                            case "off" -> {
-                                resetHealth = false;
-                                resetHunger = false;
-                            }
-                            default -> {
-                                sender.sendMessage("§7Usage: §e/world edit " + worldName + " reset <health|hunger|both|off>");
-                                return true;
-                            }
-                        }
-
-                        entry.setResetHealthOnEnter(resetHealth);
-                        entry.setResetHungerOnEnter(resetHunger);
-                        worldManager.saveSafely();
-
-                        String desc;
-                        if (!resetHealth && !resetHunger) {
-                            desc = "§7no automatic stat resets";
-                        } else if (resetHealth && resetHunger) {
-                            desc = "§areset HEALTH and HUNGER on enter";
-                        } else if (resetHealth) {
-                            desc = "§areset HEALTH on enter";
-                        } else {
-                            desc = "§areset HUNGER on enter";
-                        }
-
-                        sender.sendMessage("§aWorld §e" + entry.getName() + "§a now uses: " + desc + "§a.");
-                        return true;
-                    }
-
-                    case "gamemode": {
-                        if (args.length < 4) {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " gamemode <survival|creative|adventure|spectator|inherit>");
-                            return true;
-                        }
-                        String gmArg = args[3].toLowerCase();
-                        org.bukkit.GameMode gm = null;
-
-                        if (gmArg.startsWith("surv")) {
-                            gm = org.bukkit.GameMode.SURVIVAL;
-                        } else if (gmArg.startsWith("creat")) {
-                            gm = org.bukkit.GameMode.CREATIVE;
-                        } else if (gmArg.startsWith("adven")) {
-                            gm = org.bukkit.GameMode.ADVENTURE;
-                        } else if (gmArg.startsWith("spect")) {
-                            gm = org.bukkit.GameMode.SPECTATOR;
-                        } else if (gmArg.startsWith("inherit")) {
-                            gm = null; // inherit
-                        } else {
-                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " gamemode <survival|creative|adventure|spectator|inherit>");
-                            return true;
-                        }
-
-                        entry.setDefaultGamemode(gm);
-                        worldManager.saveSafely();
-
-                        String label = (gm == null ? "§7INHERIT server default" : "§e" + gm.name());
-                        sender.sendMessage("§aDefault gamemode for world §e" + entry.getName() + "§a set to " + label + "§a.");
-                        return true;
-                    }
-
-                    default: {
-                        sender.sendMessage("§7Usage: §e/world edit " + worldName
-                                + " <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
-                        return true;
-                    }
-                }
-            }
-
-            default: {
-                sender.sendMessage("§7World commands:");
-                sender.sendMessage("§e/world create <name> <mode> <access> [icon] [seed...]");
-                sender.sendMessage("§e/world tp <name> [player]");
-                sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
-                return true;
-            }
-        }
-    }
-
-    private boolean handlePortal(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player p)) {
-            sender.sendMessage("This command can only be used in-game.");
-            return true;
-        }
-        if (portalManager == null) {
-            p.sendMessage("§cPortal system is not initialized.");
-            return true;
-        }
-
-        // Only Discord-staff (is_staff) may manage portals
-        String key = p.getUniqueId().toString().replace("-", "");
-        PlayerStyle style = playerStyles.get(key);
-        if (style == null || !style.isStaff) {
-            p.sendMessage("§cYou are not allowed to manage portals.");
-            return true;
-        }
-
-        if (args.length == 0) {
-            p.sendMessage("§7Portal commands:");
-            p.sendMessage("§e/portal wand §7- get portal wand");
-            p.sendMessage("§e/portal create <name> <world-or-warp> §7- create portal from selection");
-            p.sendMessage("§e/portal rebuild §7- enter portal rebuild mode");
-            p.sendMessage("§e/exit_mode §7- exit portal rebuild mode");
-            p.sendMessage("§e/portals list §7- list portals");
-            p.sendMessage("§e/portals edit <name> <activate|deactivate|changetarget|changearea|delete> [...]");
-            return true;
-        }
-
-        String sub = args[0].toLowerCase(Locale.ROOT);
-
-	switch (sub) {
-            case "wand" -> {
-                if (!hasWorldAdmin(p)) {
-                    p.sendMessage("§cYou are not allowed to manage portals.");
-                    return true;
-                }
-                portalManager.giveWand(p);
-                portalManager.clearSelection(p);
-                return true;
-            }
-            case "create" -> {
-                if (!hasWorldAdmin(p)) {
-                    p.sendMessage("§cYou are not allowed to create portals.");
-                    return true;
-                }
-                if (args.length < 3) {
-                    p.sendMessage("§7Usage: §e/portal create <name> <world-or-warp>");
-                    return true;
-                }
-                String portalName = args[1];
-                String target = args[2];
-                PortalManager.PortalEntry entry =
-                        portalManager.createPortalFromSelection(p, portalName, target);
-                // errors are already messaged from inside; nothing else to do
-                return true;
-            }
-            case "rebuild" -> {
-                if (!hasWorldAdmin(p)) {
-                    p.sendMessage("§cYou are not allowed to rebuild portals.");
-                    return true;
-                }
-                portalManager.enableRebuildMode(p);
-                portalManager.giveWand(p);
-                return true;
-            }
-            default -> {
-                p.sendMessage("§cUnknown subcommand. Use §e/portal§c for help.");
-                return true;
-            }
-        }
-    }
-
-    private boolean handlePortals(CommandSender sender, String[] args) {
-        if (portalManager == null) {
-            sender.sendMessage("§cPortal system is not initialized.");
-            return true;
-        }
-
-        boolean isStaff;
-        if (sender instanceof Player p) {
-            String key = p.getUniqueId().toString().replace("-", "");
-            PlayerStyle style = playerStyles.get(key);
-            if (style == null || !style.isStaff) {
-                p.sendMessage("§cYou are not allowed to manage portals.");
-                return true;
-            }
-            isStaff = true;
-        } else {
-            // console: always allowed
-            isStaff = true;
-        }
-
-        if (args.length == 0 || args[0].equalsIgnoreCase("list")) {
-            java.util.List<PortalManager.PortalEntry> list = portalManager.getAllPortalsSorted();
-            if (list.isEmpty()) {
-                sender.sendMessage("§7No portals defined.");
-                return true;
-            }
-
-            sender.sendMessage("§7Portals:");
-            for (PortalManager.PortalEntry e : list) {
-                if (!isStaff && !e.isActive()) {
-                    continue; // hide inactive portals from non-staff
-                }
-                String status = e.isActive() ? "§aACTIVE" : "§cINACTIVE";
-                sender.sendMessage("  §e" + e.getName() + "§7 -> "
-                        + (e.getTargetType() == PortalManager.TargetType.WORLD ? "world " : "warp ")
-                        + "§f" + e.getTargetName()
-                        + " §7[" + status + "§7]"
-                        + " in §f" + e.getWorldName());
-            }
-            return true;
-        }
-
-        if (!args[0].equalsIgnoreCase("edit")) {
-            sender.sendMessage("§7Usage: §e/portals list §7or §e/portals edit <name> <...>");
-            return true;
-        }
-
-        if (args.length < 3) {
-            sender.sendMessage("§7Usage: §e/portals edit <name> <activate|deactivate|changetarget|changearea|delete> [...]");
-            return true;
-        }
-
-        if (!(sender instanceof Player p)) {
-            sender.sendMessage("Only players may edit portals.");
-            return true;
-        }
-        if (!hasWorldAdmin(p)) {
-            p.sendMessage("§cYou are not allowed to edit portals.");
-            return true;
-        }
-
-        String portalName = args[1];
-        String action = args[2].toLowerCase(Locale.ROOT);
-
-        PortalManager.PortalEntry entry = portalManager.getPortalByName(portalName);
-        if (entry == null) {
-            p.sendMessage("§cNo portal named §e" + portalName + "§c found.");
-            return true;
-        }
-
-        switch (action) {
-            case "activate" -> {
-                portalManager.setPortalActive(entry, true);
-                p.sendMessage("§aPortal §e" + entry.getName() + "§a activated.");
-                return true;
-            }
-            case "deactivate" -> {
-                portalManager.setPortalActive(entry, false);
-                p.sendMessage("§aPortal §e" + entry.getName() + "§a deactivated.");
-                return true;
-            }
-            case "changetarget" -> {
-                if (args.length < 4) {
-                    p.sendMessage("§7Usage: §e/portals edit " + portalName + " changetarget <world-or-warp>");
-                    return true;
-                }
-                String newTarget = args[3];
-                portalManager.updatePortalTarget(p, entry, newTarget);
-                return true;
-            }
-            case "changearea" -> {
-                portalManager.changePortalAreaFromSelection(p, entry);
-                return true;
-            }
-            case "delete" -> {
-                portalManager.deletePortal(entry);
-                p.sendMessage("§cDeleted portal §e" + portalName + "§c and cleared its blocks.");
-                return true;
-            }
-            default -> {
-                p.sendMessage("§7Usage: §e/portals edit " + portalName
-                        + " <activate|deactivate|changetarget|changearea|delete> [...]");
-                return true;
-            }
-        }
-    }
 
     private boolean handleExitMode(CommandSender sender, String[] args) {
         if (!(sender instanceof Player p)) {
             sender.sendMessage("This command can only be used in-game.");
             return true;
         }
-        if (portalManager == null) {
-            p.sendMessage("§cPortal system is not initialized.");
-            return true;
-        }
-        if (!portalManager.isInRebuildMode(p)) {
-            p.sendMessage("§7You are not currently in portal rebuild mode.");
-            return true;
-        }
-        portalManager.disableRebuildMode(p);
         return true;
     }
 
