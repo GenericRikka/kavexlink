@@ -23,3 +23,7 @@ ssl:
 direct_messages:
   retention_days: 30
 
+friends:
+  dm-history-days: 30
+  allow-friend-teleport: true     # If true, reciprocal friends can use /ftp <name>
+  teleport-cooldown-seconds: 60   # Anti-spam interval threshold

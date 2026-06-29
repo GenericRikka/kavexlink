@@ -326,6 +326,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         getCommand("friendrequest").setExecutor(new FriendRequestCommand(this));
         getCommand("friend").setExecutor(new FriendCommand(this));
         getCommand("friends").setExecutor(new FriendsGuiCommand(this));
+        getCommand("ftp").setExecutor(this);
 
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(new FriendsListener(this), this);
@@ -1835,6 +1836,48 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 break;
             }
         }
+
+        return true;
+    }
+
+    private boolean handleFriendTeleport(Player p, String[] args) {
+        if (!getConfig().getBoolean("friends.allow-friend-teleport", false)) {
+            p.sendMessage("§cFriend-to-friend teleportation is disabled on this server.");
+            return true;
+        }
+
+        if (args.length < 1) {
+            p.sendMessage("§7Usage: §e/ftp <player_name>");
+            return true;
+        }
+
+        String targetName = args[0];
+        Player target = Bukkit.getPlayer(targetName);
+
+        if (target == null || !target.isOnline()) {
+            p.sendMessage("§cThat player is not online right now.");
+            return true;
+        }
+
+        if (target.getUniqueId().equals(p.getUniqueId())) {
+            p.sendMessage("§cYou cannot teleport to yourself.");
+            return true;
+        }
+
+        if (this.friendManager == null || !this.friendManager.areMutuallyFriends(p.getUniqueId(), target.getUniqueId())) {
+            p.sendMessage("§cYou can only teleport to players if you are mutually registered as friends.");
+            return true;
+        }
+
+        // Blindness + Enderman chimes
+        p.addPotionEffect(new org.bukkit.potion.PotionEffect(org.bukkit.potion.PotionEffectType.BLINDNESS, 25, 1, false, false, false));
+        p.playSound(p.getLocation(), org.bukkit.Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+    
+        getServer().getScheduler().runTaskLater(this, () -> {
+            p.teleport(target.getLocation());
+            p.sendMessage("§aTeleported via friend link to §e" + target.getName() + "§a.");
+            target.sendMessage("§e" + p.getName() + " §7teleported to your location.");
+        }, 3L);
 
         return true;
     }

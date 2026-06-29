@@ -123,6 +123,18 @@ public class FriendManager {
         return true;
     }
 
+    public boolean areMutuallyFriends(UUID uuidA, UUID uuidB) {
+        if (uuidA == null || uuidB == null) return false;
+
+        // Query your real memory map variable directly
+        if (this.friends.containsKey(uuidA)) {
+            Set<UUID> playerFriends = this.friends.get(uuidA);
+            return playerFriends != null && playerFriends.contains(uuidB);
+        }
+
+        return false;
+    }
+
     public Set<UUID> getIncomingRequests(UUID player) {
         return incomingRequests.getOrDefault(player, Collections.emptySet());
     }

@@ -71,3 +71,8 @@ commands:
   exit_mode:
     description: Exit special edit modes (e.g. portal rebuild)
     usage: /exit_mode
+  ftp:
+    description: Teleport instantly to an online mutual friend.
+    usage: /ftp <player>
+    permission: kavexlink.command.ftp
+    permission-message: §cYou do not have permission to use friend teleportation.
