@@ -961,6 +961,20 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         return result;
     }
 
+    private List<String> tabCompleteParticles(String partial) {
+    String p = partial == null ? "" : partial.toUpperCase(Locale.ROOT);
+    List<String> result = new ArrayList<>();
+
+    for (org.bukkit.Particle particle : org.bukkit.Particle.values()) {
+        String name = particle.name();
+        if (p.isEmpty() || name.startsWith(p)) {
+            result.add(name);
+        }
+    }
+    Collections.sort(result, String.CASE_INSENSITIVE_ORDER);
+    return result;
+}
+
     private List<String> tabCompleteSetWarp(CommandSender sender, String[] args) {
         if (!(sender instanceof Player)) {
             return Collections.emptyList();
@@ -1314,7 +1328,13 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 if ("changetarget".startsWith(partial)) actions.add("changetarget");
                 if ("changearea".startsWith(partial))   actions.add("changearea");
                 if ("delete".startsWith(partial))      actions.add("delete");
+		if ("particle".startsWith(partial))     actions.add("particle");
                 return actions;
+            }
+
+	    if (args.length == 4 && "particle".equalsIgnoreCase(args[2])) {
+                // User typed: /portals edit <name> particle [tab]
+                return tabCompleteParticles(args[3]);
             }
 
             // no further structured args worth completing here
@@ -3284,7 +3304,6 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             }
             isStaff = true;
         } else {
-            // console: always allowed
             isStaff = true;
         }
 
@@ -3298,7 +3317,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             sender.sendMessage("§7Portals:");
             for (PortalManager.PortalEntry e : list) {
                 if (!isStaff && !e.isActive()) {
-                    continue; // hide inactive portals from non-staff
+                    continue; 
                 }
                 String status = e.isActive() ? "§aACTIVE" : "§cINACTIVE";
                 sender.sendMessage("  §e" + e.getName() + "§7 -> "
@@ -3316,7 +3335,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         }
 
         if (args.length < 3) {
-            sender.sendMessage("§7Usage: §e/portals edit <name> <activate|deactivate|changetarget|changearea|delete> [...]");
+            sender.sendMessage("§7Usage: §e/portals edit <name> <activate|deactivate|changetarget|changearea|delete|particle> [...]");
             return true;
         }
 
@@ -3367,9 +3386,34 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 p.sendMessage("§cDeleted portal §e" + portalName + "§c and cleared its blocks.");
                 return true;
             }
+            case "particle" -> {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/portals edit " + portalName + " particle <type> [strength]");
+                    return true;
+                }
+                String particleName = args[3].toUpperCase(Locale.ROOT);
+                int strength = 2;
+                if (args.length >= 5) {
+                    try {
+                        strength = Integer.parseInt(args[4]);
+                    } catch (NumberFormatException ex) {
+                        p.sendMessage("§cStrength must be an integer mapping.");
+                        return true;
+                    }
+                }
+                try {
+                    org.bukkit.Particle.valueOf(particleName);
+                } catch (IllegalArgumentException ex) {
+                    p.sendMessage("§cUnknown particle type: §f" + particleName);
+                    return true;
+                }
+                portalManager.setPortalParticle(entry, particleName, strength);
+                p.sendMessage("§aPortal §e" + entry.getName() + "§a particle ambiance set to §e" + particleName + " §7(strength: " + strength + ").");
+                return true;
+            }
             default -> {
                 p.sendMessage("§7Usage: §e/portals edit " + portalName
-                        + " <activate|deactivate|changetarget|changearea|delete> [...]");
+                        + " <activate|deactivate|changetarget|changearea|delete|particle> [...]");
                 return true;
             }
         }
