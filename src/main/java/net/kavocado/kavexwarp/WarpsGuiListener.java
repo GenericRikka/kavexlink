@@ -84,10 +84,10 @@ public class WarpsGuiListener implements Listener {
                 false  // showIcon
         ));
 
-        // 2) Enderman teleport sound
+        // 2) Bell teleport sound
         p.playSound(
                 p.getLocation(),
-                Sound.ENTITY_ENDERMAN_TELEPORT,
+                Sound.BLOCK_NOTE_BLOCK_BELL,
                 1.0f,
                 1.0f
         );

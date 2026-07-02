@@ -5,6 +5,15 @@ join-teleport:
   warp: spawn
 
 # Shown in the warps GUI title, e.g. "MyServer Warps".
-# Leave blank to fall back to the server's MOTD, or "Minecraft" if that's also unset.
 server-name: ""
+
+# Controls the order categories appear in as you page through the warps GUI.
+# List them in the order you want, e.g.:
+#   category-order:
+#     - Spawn
+#     - Farms
+#     - Structures
+# Any category not listed here is appended afterward, sorted alphabetically.
+# Leave this empty to sort every category alphabetically.
+category-order: []
 

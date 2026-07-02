@@ -13,6 +13,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
@@ -20,6 +21,7 @@ import org.bukkit.potion.PotionEffectType;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -85,6 +87,20 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             }
         }
         return "Minecraft";
+    }
+
+    /**
+     * The raw server-name from config.yml, trimmed, or null if it's left unset/blank.
+     * Unlike {@link #getServerDisplayName()} this never falls back to the MOTD or
+     * "Minecraft" — it's for callers (like the warps GUI title) that want to omit the
+     * server name entirely rather than show a guessed one when it isn't configured.
+     */
+    public String getConfiguredServerName() {
+        String configured = getConfig().getString("server-name", "");
+        if (configured != null && !configured.trim().isEmpty()) {
+            return configured.trim();
+        }
+        return null;
     }
 
     /**
@@ -210,7 +226,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
                 false,
                 false
         ));
-        p.playSound(p.getLocation(), Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+        p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_BELL, 1.0f, 0.7f);
 
         getServer().getScheduler().runTaskLater(
                 this,
@@ -281,7 +297,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
                 false,
                 false
         ));
-        p.playSound(p.getLocation(), Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.0f);
+        p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_BELL, 1.0f, 1.0f);
 
         getServer().getScheduler().runTaskLater(this, () -> {
             p.teleport(loc);
@@ -291,6 +307,36 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
         return true;
     }
 
+    /**
+     * Resolves an icon argument for /setwarp or /warp edit icon: either the special
+     * "hand" keyword — which captures whatever item the player is holding, including
+     * a custom head's skin or a banner's color/pattern layers — or a plain material
+     * name as before. Returns null (after messaging the player) if it's invalid.
+     */
+    private ItemStack resolveIconArg(Player p, String arg) {
+        if (arg.equalsIgnoreCase("hand")) {
+            ItemStack held = p.getInventory().getItemInMainHand();
+            if (held.getType() == Material.AIR) {
+                p.sendMessage("§cYou're not holding anything to use as an icon.");
+                return null;
+            }
+            return held.clone();
+        }
+
+        Material m = Material.matchMaterial(arg);
+        if (m == null) {
+            p.sendMessage("§cUnknown material: §f" + arg);
+            p.sendMessage("§7Example: §eDIAMOND_SWORD§7, §eSTONE§7, or §ehand§7 to use your held item.");
+            return null;
+        }
+        if (!m.isItem()) {
+            p.sendMessage("§c" + m.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
+            p.sendMessage("§7Try something like §eLAVA_BUCKET§7 instead, or §ehand§7 to use your held item.");
+            return null;
+        }
+        return new ItemStack(m);
+    }
+
     private boolean handleSetWarp(CommandSender sender, String[] args) {
         if (!(sender instanceof Player p)) {
             sender.sendMessage("This command can only be used in-game.");
@@ -298,7 +344,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
         }
 
         if (args.length < 2) {
-            p.sendMessage("§7Usage: §e/setwarp <name> <public|private> [icon]");
+            p.sendMessage("§7Usage: §e/setwarp <name> <public|private> [icon|hand] [category]");
             return true;
         }
 
@@ -325,20 +371,20 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             if (requireSetPrivateWarpPermission(p) == null) return true;
         }
 
-        Material icon = Material.DIRT;
+        ItemStack icon = new ItemStack(Material.DIRT);
         if (args.length >= 3) {
-            Material m = Material.matchMaterial(args[2]);
-            if (m == null) {
-                p.sendMessage("§cUnknown material: §f" + args[2]);
-                p.sendMessage("§7Example: §eDIAMOND_SWORD§7 or §eSTONE");
+            ItemStack resolved = resolveIconArg(p, args[2]);
+            if (resolved == null) return true;
+            icon = resolved;
+        }
+
+        String category = WarpManager.DEFAULT_CATEGORY;
+        if (args.length >= 4) {
+            category = String.join(" ", Arrays.copyOfRange(args, 3, args.length)).trim();
+            if (category.length() > 32) {
+                p.sendMessage("§cCategory name is too long (max 32 characters).");
                 return true;
             }
-            if (!m.isItem()) {
-                p.sendMessage("§c" + m.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
-                p.sendMessage("§7Try something like §eLAVA_BUCKET§7 instead.");
-                return true;
-            }
-            icon = m;
         }
 
         if (warpManager == null) {
@@ -351,20 +397,22 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             if (existing != null) {
                 warpManager.updateWarpLocation(existing, p.getLocation());
                 warpManager.updateWarpIcon(existing, icon);
+                warpManager.updateWarpCategory(existing, category);
                 p.sendMessage("§aUpdated public warp §e" + name + "§a at your current location.");
             } else {
-                warpManager.createWarp(p.getUniqueId(), true, name, p.getLocation(), icon);
-                p.sendMessage("§aCreated new public warp §e" + name + "§a.");
+                warpManager.createWarp(p.getUniqueId(), true, name, p.getLocation(), icon, category);
+                p.sendMessage("§aCreated new public warp §e" + name + "§a in category §e" + category + "§a.");
             }
         } else {
             WarpManager.Warp existing = warpManager.getPrivateWarp(p.getUniqueId(), name);
             if (existing != null) {
                 warpManager.updateWarpLocation(existing, p.getLocation());
                 warpManager.updateWarpIcon(existing, icon);
+                warpManager.updateWarpCategory(existing, category);
                 p.sendMessage("§aUpdated your private warp §e" + name + "§a.");
             } else {
-                warpManager.createWarp(p.getUniqueId(), false, name, p.getLocation(), icon);
-                p.sendMessage("§aCreated new private warp §e" + name + "§a.");
+                warpManager.createWarp(p.getUniqueId(), false, name, p.getLocation(), icon, category);
+                p.sendMessage("§aCreated new private warp §e" + name + "§a in category §e" + category + "§a.");
             }
         }
 
@@ -461,7 +509,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
         }
 
         if (args.length < 2 || !args[0].equalsIgnoreCase("edit")) {
-            p.sendMessage("§7Usage: §e/warp edit <name> <rename|relocate|icon|order|delete> ...");
+            p.sendMessage("§7Usage: §e/warp edit <name> <rename|relocate|icon|order|category|delete> ...");
             return true;
         }
 
@@ -494,7 +542,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
         }
 
         if (args.length < 3) {
-            p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|delete> ...");
+            p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|category|delete> ...");
             return true;
         }
 
@@ -538,20 +586,12 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             }
             case "icon": {
                 if (args.length < 4) {
-                    p.sendMessage("§7Usage: §e/warp edit " + name + " icon <material>");
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " icon <material|hand>");
                     return true;
                 }
-                Material mat = Material.matchMaterial(args[3]);
-                if (mat == null) {
-                    p.sendMessage("§cUnknown material: §f" + args[3]);
-                    return true;
-                }
-                if (!mat.isItem()) {
-                    p.sendMessage("§c" + mat.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
-                    p.sendMessage("§7Use an actual item like §eLAVA_BUCKET§7, §eNETHERRACK§7, etc.");
-                    return true;
-                }
-                warpManager.updateWarpIcon(warp, mat);
+                ItemStack resolved = resolveIconArg(p, args[3]);
+                if (resolved == null) return true;
+                warpManager.updateWarpIcon(warp, resolved);
                 warpManager.save();
                 p.sendMessage("§aUpdated icon for warp §e" + warp.getName() + "§a.");
                 break;
@@ -574,6 +614,21 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
                 p.sendMessage("§aUpdated GUI order for warp §e" + warp.getName() + "§a to §e" + order + "§a.");
                 break;
             }
+            case "category": {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " category <categoryName>");
+                    return true;
+                }
+                String newCategory = String.join(" ", Arrays.copyOfRange(args, 3, args.length)).trim();
+                if (newCategory.length() > 32) {
+                    p.sendMessage("§cCategory name is too long (max 32 characters).");
+                    return true;
+                }
+                warpManager.updateWarpCategory(warp, newCategory);
+                warpManager.save();
+                p.sendMessage("§aWarp §e" + warp.getName() + "§a moved to category §e" + warp.getCategory() + "§a.");
+                break;
+            }
             case "delete": {
                 warpManager.deleteWarp(warp);
                 warpManager.save();
@@ -581,7 +636,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
                 break;
             }
             default: {
-                p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|delete> ...");
+                p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|category|delete> ...");
                 break;
             }
         }
@@ -610,6 +665,10 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
         String p = partial == null ? "" : partial.toUpperCase(Locale.ROOT);
         List<String> result = new ArrayList<>();
 
+        if ("HAND".startsWith(p)) {
+            result.add("hand");
+        }
+
         for (Material m : Material.values()) {
             if (!m.isItem()) continue;
             String matName = m.name();
@@ -625,7 +684,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             return Collections.emptyList();
         }
 
-        // /setwarp <name> <public|private> [icon]
+        // /setwarp <name> <public|private> [icon] [category]
         if (args.length == 2) {
             String partial = args[1].toLowerCase(Locale.ROOT);
             List<String> options = new ArrayList<>();
@@ -638,7 +697,25 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             return tabCompleteMaterials(args[2]);
         }
 
+        if (args.length == 4) {
+            return tabCompleteCategories(args[3]);
+        }
+
         return Collections.emptyList();
+    }
+
+    private List<String> tabCompleteCategories(String partial) {
+        if (warpManager == null) {
+            return Collections.emptyList();
+        }
+        String p = partial == null ? "" : partial.toLowerCase(Locale.ROOT);
+        List<String> result = new ArrayList<>();
+        for (String category : warpManager.getKnownCategories()) {
+            if (p.isEmpty() || category.toLowerCase(Locale.ROOT).startsWith(p)) {
+                result.add(category);
+            }
+        }
+        return result;
     }
 
     private List<String> tabCompleteWarp(CommandSender sender, String[] args) {
@@ -646,7 +723,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             return Collections.emptyList();
         }
 
-        // /warp edit <name> <rename|relocate|icon|order|delete> ...
+        // /warp edit <name> <rename|relocate|icon|order|category|delete> ...
         // /warp jointp <on|off>
         // /warp jointp warp <name>
         if (args.length == 1) {
@@ -688,6 +765,7 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
             if ("relocate".startsWith(partial)) subs.add("relocate");
             if ("icon".startsWith(partial)) subs.add("icon");
             if ("order".startsWith(partial)) subs.add("order");
+            if ("category".startsWith(partial)) subs.add("category");
             if ("delete".startsWith(partial)) subs.add("delete");
             return subs;
         }
@@ -696,6 +774,12 @@ public class KavexWarpPlugin extends JavaPlugin implements TabCompleter, Listene
                 && "edit".equalsIgnoreCase(args[0])
                 && "icon".equalsIgnoreCase(args[2])) {
             return tabCompleteMaterials(args[3]);
+        }
+
+        if (args.length == 4
+                && "edit".equalsIgnoreCase(args[0])
+                && "category".equalsIgnoreCase(args[2])) {
+            return tabCompleteCategories(args[3]);
         }
 
         return Collections.emptyList();

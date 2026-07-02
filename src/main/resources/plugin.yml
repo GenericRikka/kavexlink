@@ -1,20 +1,20 @@
 name: KavexWarp
 version: '1.0'
 main: net.kavocado.kavexwarp.KavexWarpPlugin
-api-version: '26.1'
+api-version: '1.21'
 description: Public and private warps with a GUI.
-author: GenericRikka
+author: Rikka
 
 commands:
   setwarp:
     description: Create or update a warp at your current location.
-    usage: /setwarp <name> <public|private> [icon]
+    usage: /setwarp <name> <public|private> [icon] [category]
   warps:
     description: Open the warps GUI.
     usage: /warps [public|private]
   warp:
     description: Edit an existing warp, or manage join-teleport.
-    usage: /warp edit <name> <rename|relocate|icon|order|delete> ... | /warp jointp <on|off> | /warp jointp warp <name>
+    usage: /warp edit <name> <rename|relocate|icon|order|category|delete> ... | /warp jointp <on|off> | /warp jointp warp <name>
   back:
     description: Return to your location before your last teleport.
     usage: /back
