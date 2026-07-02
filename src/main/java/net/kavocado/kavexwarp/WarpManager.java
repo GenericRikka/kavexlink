@@ -1,4 +1,4 @@
-package net.kavocado.kavexlink;
+package net.kavocado.kavexwarp;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -14,13 +14,13 @@ public class WarpManager {
 
     public static final String PUBLIC_OWNER = "PUBLIC";
 
-    private final KavexLinkPlugin plugin;
+    private final KavexWarpPlugin plugin;
     private final File file;
 
     private final Map<String, Warp> warpsById = new HashMap<>();
     private final Map<String, Warp> warpsByKey = new HashMap<>();
 
-    public WarpManager(KavexLinkPlugin plugin) {
+    public WarpManager(KavexWarpPlugin plugin) {
         this.plugin = plugin;
         this.file = new File(plugin.getDataFolder(), "warps.yml");
         load();
@@ -267,7 +267,7 @@ public class WarpManager {
         public Material getIcon() { return icon; }
         public int getOrder() { return order; }
 
-	public Location getLocation() {
+        public Location getLocation() {
             World w = Bukkit.getWorld(this.world);
             if (w == null) {
                 return null;
@@ -286,4 +286,3 @@ public class WarpManager {
         private void setOrder(int order) { this.order = order; }
     }
 }
-

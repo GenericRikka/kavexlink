@@ -12,7 +12,8 @@ repositories {
 }
 
 dependencies {
-    compileOnly("io.papermc.paper:paper-api:26.2.local-SNAPSHOT")
+    //compileOnly("io.papermc.paper:paper-api:26.2.local-SNAPSHOT")
+    compileOnly("io.papermc.paper:paper-api:26.1.2.build.+")
 }
 
 java {
@@ -28,6 +29,6 @@ tasks.processResources {
 }
 
 tasks.jar {
-    archiveBaseName.set("KavexLink")
+    archiveBaseName.set("KavexWarp")
 }
 

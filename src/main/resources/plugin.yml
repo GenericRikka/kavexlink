@@ -1,78 +1,37 @@
-name: KavexLink
-main: net.kavocado.kavexlink.KavexLinkPlugin
-version: 0.1.0
-api-version: '26.2'
+name: KavexWarp
+version: '1.0'
+main: net.kavocado.kavexwarp.KavexWarpPlugin
+api-version: '26.1'
+description: Public and private warps with a GUI.
 author: GenericRikka
 
 commands:
-  linkdiscord:
-    description: Link your Minecraft account with Discord
-    usage: "/linkdiscord"
-  kavexkick:
-    description: Kick a player using Discord permissions
-    usage: "/kavexkick <player> [reason]"
-  kavexban:
-    description: Permanently ban a player using Discord permissions
-    usage: "/kavexban <player> [reason]"
-  kavextempban:
-    description: Temporarily ban a player using Discord permissions
-    usage: "/kavextempban <player> <minutes> [reason]"
-  kavexmute:
-    description: Temporarily mute a player using Discord permissions
-    usage: "/kavexmute <player> <minutes> [reason]"
-  kavexpardon:
-    description: Unban a player
-    usage: "/kavexpardon <player> [reason]"
-  kavexunmute:
-    description: Unmute a player
-    usage: "/kavexunmute <player> [reason]"
-  friendrequest:
-    description: Manage friend requests
-    usage: "/friendrequest <subcommand>"
-  friend:
-    description: Manage your friends list
-    usage: "/friend <subcommand>"
-  friends:
-    description: Open the friends GUI
-    usage: "/friends"
-  dm:
-    description: Direct message a friend
-    usage: "/dm <friend> <message>"
-  reply:
-    description: Reply to the last DM partner
-    usage: "/reply <message>"
-  exit:
-    description: Leave direct-message mode
-    usage: "/exit"
-  notifyping:
-    description: Enable or disable ping sounds for mentions and DMs
-    usage: "/notifyping <on|off>"
   setwarp:
-    description: Create or update a warp at your current position
+    description: Create or update a warp at your current location.
     usage: /setwarp <name> <public|private> [icon]
   warps:
-    description: Open the warps GUI
+    description: Open the warps GUI.
     usage: /warps [public|private]
   warp:
-    description: Edit an existing warp
-    usage: /warp edit <name> <rename|relocate|icon|order|delete> ...
-  worlds:
-    description: Open worlds GUI
-    usage: /worlds
-  world:
-    description: World management (create/tp)
-    usage: /world <create|tp> ...
-  portal:
-    description: Portal selection and creation
-    usage: /portal
-  portals:
-    description: List and edit portals
-    usage: /portals
-  exit_mode:
-    description: Exit special edit modes (e.g. portal rebuild)
-    usage: /exit_mode
-  ftp:
-    description: Teleport instantly to an online mutual friend.
-    usage: /ftp <player>
-    permission: kavexlink.command.ftp
-    permission-message: §cYou do not have permission to use friend teleportation.
+    description: Edit an existing warp, or manage join-teleport.
+    usage: /warp edit <name> <rename|relocate|icon|order|delete> ... | /warp jointp <on|off> | /warp jointp warp <name>
+  back:
+    description: Return to your location before your last teleport.
+    usage: /back
+
+permissions:
+  kavexwarp.admin:
+    description: Allows editing (rename/relocate/icon/order/delete) PUBLIC warps, and implies kavexwarp.setwarp.public.
+    default: op
+    children:
+      kavexwarp.setwarp.public: true
+      kavex.setwarp.private: true
+  kavexwarp.setwarp.public:
+    description: Allows creating or updating PUBLIC warps via /setwarp.
+    default: false
+  kavexwarp.setwarp.private:
+    description: Allows creating or updating your own PRIVATE warps via /setwarp.
+    default: false
+  kavexwarp.back:
+    description: Allows using /back to return to your location before your last teleport.
+    default: true
