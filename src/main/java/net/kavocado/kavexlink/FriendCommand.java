@@ -31,12 +31,14 @@ public class FriendCommand implements CommandExecutor {
 
         if (args.length == 0) {
             p.sendMessage("§7/friend list §f- list your friends");
+            p.sendMessage("§7/friend accept <name> §f- accept a pending friend request");
+            p.sendMessage("§7/friend deny <name> §f- decline a pending friend request");
             p.sendMessage("§7/friend remove <name> §f- remove a friend");
             p.sendMessage("§7/friend unfriend <name> §f- alias for remove");
             p.sendMessage("§7/friend block <name> §f- block a player (no requests, no DMs)");
             p.sendMessage("§7/friend unblock <name> §f- unblock a player");
             p.sendMessage("§7/friend blocked §f- list blocked players");
-            p.sendMessage("§7For requests, use §e/friendrequest§7.");
+            p.sendMessage("§7Use §e/friendrequest <name> §7to send a request.");
             showFriendList(p, fm, self);
             return true;
         }
@@ -45,6 +47,24 @@ public class FriendCommand implements CommandExecutor {
         switch (sub) {
             case "list":
                 showFriendList(p, fm, self);
+                return true;
+
+            case "accept":
+                if (args.length < 2) {
+                    p.sendMessage("§7Usage: §e/friend accept <player>");
+                    return true;
+                }
+                handleAccept(p, fm, self, args[1]);
+                return true;
+
+            case "deny":
+            case "decline":
+            case "reject":
+                if (args.length < 2) {
+                    p.sendMessage("§7Usage: §e/friend deny <player>");
+                    return true;
+                }
+                handleDeny(p, fm, self, args[1]);
                 return true;
 
             case "remove":
@@ -78,9 +98,65 @@ public class FriendCommand implements CommandExecutor {
 
             default:
                 p.sendMessage("§cUnknown subcommand.");
-                p.sendMessage("§7Use §e/friend list§7, §e/friend remove <name>§7, §e/friend block <name>§7, etc.");
+                p.sendMessage("§7Use §e/friend list§7, §e/friend accept <name>§7, §e/friend remove <name>§7, §e/friend block <name>§7, etc.");
                 return true;
         }
+    }
+
+    private OfflinePlayer resolveRequester(String targetName) {
+        OfflinePlayer op = Bukkit.getOfflinePlayerIfCached(targetName);
+        if (op == null) {
+            op = Bukkit.getOfflinePlayer(targetName); // may not have played recently / at all
+        }
+        return op;
+    }
+
+    private void handleAccept(Player p, FriendManager fm, UUID self, String targetName) {
+        OfflinePlayer op = resolveRequester(targetName);
+        if (op == null || (op.getName() == null && !op.hasPlayedBefore())) {
+            p.sendMessage("§cCould not find player '" + targetName + "'.");
+            return;
+        }
+
+        UUID requesterId = op.getUniqueId();
+        String realName = (op.getName() != null ? op.getName() : targetName);
+
+        if (!fm.getIncomingRequests(self).contains(requesterId)) {
+            p.sendMessage("§cYou have no pending friend request from §e" + realName + "§c.");
+            return;
+        }
+
+        boolean ok = fm.acceptRequest(self, requesterId);
+        if (!ok) {
+            p.sendMessage("§cFailed to accept the friend request. Please try again.");
+            return;
+        }
+
+        p.sendMessage("§aYou are now friends with §e" + realName + "§a.");
+    }
+
+    private void handleDeny(Player p, FriendManager fm, UUID self, String targetName) {
+        OfflinePlayer op = resolveRequester(targetName);
+        if (op == null || (op.getName() == null && !op.hasPlayedBefore())) {
+            p.sendMessage("§cCould not find player '" + targetName + "'.");
+            return;
+        }
+
+        UUID requesterId = op.getUniqueId();
+        String realName = (op.getName() != null ? op.getName() : targetName);
+
+        if (!fm.getIncomingRequests(self).contains(requesterId)) {
+            p.sendMessage("§cYou have no pending friend request from §e" + realName + "§c.");
+            return;
+        }
+
+        boolean ok = fm.denyRequest(self, requesterId);
+        if (!ok) {
+            p.sendMessage("§cFailed to deny the friend request. Please try again.");
+            return;
+        }
+
+        p.sendMessage("§7You denied the friend request from §e" + realName + "§7.");
     }
 
     private void showFriendList(Player p, FriendManager fm, UUID self) {

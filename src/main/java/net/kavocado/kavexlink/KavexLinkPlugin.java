@@ -347,7 +347,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         	"kavextempban",
         	"kavexmute",
         	"kavexpardon",
-        	"kavexunmute"
+        	"kavexunmute",
+		"friend"
 	};
 
 	for (String cmdName : tabbedCommands) {
@@ -383,6 +384,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 return tabCompleteNotifyPing(sender, args);
             case "dm":
                 return tabCompleteDm(sender, args);
+	    case "friend":
+                return tabCompleteFriend(sender, args);
             case "kavexkick":
             case "kavexban":
             case "kavextempban":
@@ -426,6 +429,11 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         if (worldManager != null) {
             worldManager.saveSafely();
 	}
+
+	 if (worldProfileManager != null) {
+            worldProfileManager.saveAllToDisk();
+        }
+
 
         // Clean up bossbars
         for (BossBar bar : dmBossBars.values()) {
@@ -1220,6 +1228,70 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
         return names;
     }
+
+    private static final List<String> FRIEND_SUBCOMMANDS = Arrays.asList(
+            "list", "accept", "deny", "remove", "unfriend", "block", "unblock", "blocked");
+
+    private List<String> tabCompleteFriend(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            return Collections.emptyList();
+        }
+
+        if (args.length == 1) {
+            String partial = args[0].toLowerCase(Locale.ROOT);
+            List<String> out = new ArrayList<>();
+            for (String sub : FRIEND_SUBCOMMANDS) {
+                if (sub.startsWith(partial)) out.add(sub);
+            }
+            return out;
+        }
+
+        if (args.length == 2) {
+            String sub = args[0].toLowerCase(Locale.ROOT);
+            String partial = args[1].toLowerCase(Locale.ROOT);
+            List<String> names = new ArrayList<>();
+
+            if (sub.equals("accept") || sub.equals("deny")) {
+                // Only suggest players who actually have a pending request with us.
+                for (UUID id : friendManager.getIncomingRequests(p.getUniqueId())) {
+                    OfflinePlayer op = Bukkit.getOfflinePlayer(id);
+                    String n = op.getName();
+                    if (n != null && n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                        names.add(n);
+                    }
+                }
+            } else if (sub.equals("remove") || sub.equals("unfriend")) {
+                for (UUID id : friendManager.getFriends(p.getUniqueId())) {
+                    OfflinePlayer op = Bukkit.getOfflinePlayer(id);
+                    String n = op.getName();
+                    if (n != null && n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                        names.add(n);
+                    }
+                }
+            } else if (sub.equals("block")) {
+                for (Player online : Bukkit.getOnlinePlayers()) {
+                    String n = online.getName();
+                    if (n.toLowerCase(Locale.ROOT).startsWith(partial)) names.add(n);
+                }
+            } else if (sub.equals("unblock")) {
+                for (UUID id : friendManager.getBlocked(p.getUniqueId())) {
+                    OfflinePlayer op = Bukkit.getOfflinePlayer(id);
+                    String n = op.getName();
+                    if (n != null && n.toLowerCase(Locale.ROOT).startsWith(partial)) {
+                        names.add(n);
+                    }
+                }
+            } else {
+                return Collections.emptyList();
+            }
+
+            Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+            return names;
+        }
+
+        return Collections.emptyList();
+    }
+
 
     private List<String> tabCompleteDm(CommandSender sender, String[] args) {
         if (!(sender instanceof Player p)) {
@@ -2131,6 +2203,14 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
     public void onPlayerQuit(PlayerQuitEvent e) {
         Player p = e.getPlayer();
         sendEvent("quit", p, "disconnected");
+
+	 // Snapshot + persist the player's current world profile so a
+        // reconnect restores exactly what they had, instead of an old
+        // in-memory snapshot from their last world change.
+        if (worldProfileManager != null) {
+            worldProfileManager.handleQuit(p);
+        }
+
 
         UUID uuid = p.getUniqueId();
         Set<UUID> friends = friendManager.getFriends(uuid);
