@@ -1,6 +1,8 @@
 package net.kavocado.kavexlink;
 
+import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.Sound;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -9,7 +11,6 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
-import org.bukkit.Sound;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 
@@ -27,6 +28,18 @@ public class WarpsGuiListener implements Listener {
     public void onInventoryClick(InventoryClickEvent e) {
         if (!(e.getWhoClicked() instanceof Player p)) return;
 
+        if (!(e.getView().getTopInventory().getHolder() instanceof WarpsGuiHolder holder)) {
+            return; // not one of our warps GUIs
+        }
+
+        // Only intercept clicks inside the GUI itself; let the player's own inventory behave normally.
+        if (e.getClickedInventory() == null || !e.getClickedInventory().equals(e.getView().getTopInventory())) {
+            return;
+        }
+
+        // Cancel everything in this GUI - background glass, page indicator, arrows, and warp icons alike.
+        e.setCancelled(true);
+
         ItemStack item = e.getCurrentItem();
         if (item == null) return;
 
@@ -34,10 +47,18 @@ public class WarpsGuiListener implements Listener {
         if (meta == null) return;
 
         PersistentDataContainer pdc = meta.getPersistentDataContainer();
-        String warpId = pdc.get(plugin.getWarpKey(), PersistentDataType.STRING);
-        if (warpId == null) return; // not one of our warp items
 
-        e.setCancelled(true); // don't let them grab the item
+        String pageAction = pdc.get(plugin.getPageActionKey(), PersistentDataType.STRING);
+        if (pageAction != null) {
+            int newPage = holder.getPage() + ("next".equals(pageAction) ? 1 : -1);
+            // Defer a tick so we're not mutating the inventory view from inside its own click event.
+            Bukkit.getScheduler().runTask(plugin, () ->
+                    WarpsGui.openPage(plugin, p, holder.isPublicWarps(), holder.getOwner(), newPage));
+            return;
+        }
+
+        String warpId = pdc.get(plugin.getWarpKey(), PersistentDataType.STRING);
+        if (warpId == null) return; // background glass or page indicator - no action
 
         WarpManager.Warp warp = warpManager.getWarpById(warpId);
         if (warp == null) {
@@ -53,12 +74,7 @@ public class WarpsGuiListener implements Listener {
 
         p.closeInventory();
 
-        if (loc == null) {
-            p.sendMessage("§cThis warp has an invalid location.");
-            return;
-        }
-
-        // 1) Short “black frame” via BLINDNESS
+        // 1) Short "black frame" via BLINDNESS
         p.addPotionEffect(new PotionEffect(
                 PotionEffectType.BLINDNESS,
                 25,   // ticks (~1.25 seconds)
@@ -68,10 +84,10 @@ public class WarpsGuiListener implements Listener {
                 false  // showIcon
         ));
 
-        // 2) Enderman teleport sound
+        // 2) Bell teleport sound
         p.playSound(
                 p.getLocation(),
-                Sound.ENTITY_ENDERMAN_TELEPORT,
+                Sound.BLOCK_NOTE_BLOCK_BELL,
                 1.0f,
                 1.0f
         );
@@ -83,8 +99,7 @@ public class WarpsGuiListener implements Listener {
                     p.teleport(loc);
                     p.sendMessage("§aWarped to §e" + warp.getName() + "§a.");
                 },
-                3L // ~0.15s delay; tweak if you like
+                3L // ~0.15s delay
         );
-
     }
 }

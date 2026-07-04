@@ -24,6 +24,11 @@ import io.papermc.paper.advancement.AdvancementDisplay;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.Sound;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.event.player.PlayerTeleportEvent;
 
 import java.io.BufferedInputStream;
 import java.io.File;
@@ -104,8 +109,10 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
     private WorldManager worldManager;
     private NamespacedKey warpKey;
     private NamespacedKey worldKey;
+    private NamespacedKey pageActionKey;
     private PortalManager portalManager;
     private WorldProfileManager worldProfileManager;
+    private BackManager backManager;
 
 
     private static class PlayerStyle {
@@ -200,6 +207,49 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         return worldKey;
     }
 
+    public NamespacedKey getPageActionKey() {
+        return pageActionKey;
+    }
+
+    public BackManager getBackManager() {
+        return backManager;
+    }
+
+    /**
+     * The raw server-name from config.yml, trimmed, or null if it's left unset/blank.
+     * Unlike the `serverName` field used for Discord status messages (which falls
+     * back to the MOTD or "Minecraft"), this is for callers like the warps GUI
+     * title that want to omit the server name entirely rather than show a guessed
+     * one when it isn't configured.
+     */
+    public String getConfiguredServerName() {
+        String configured = getConfig().getString("server-name", "");
+        if (configured != null && !configured.trim().isEmpty()) {
+            return configured.trim();
+        }
+        return null;
+    }
+
+    // ---------- Join-teleport ("jointp") config ----------
+
+    public boolean isJoinTeleportEnabled() {
+        return getConfig().getBoolean("join-teleport.enabled", false);
+    }
+
+    public void setJoinTeleportEnabled(boolean enabled) {
+        getConfig().set("join-teleport.enabled", enabled);
+        saveConfig();
+    }
+
+    public String getJoinTeleportWarpName() {
+        return getConfig().getString("join-teleport.warp", "spawn");
+    }
+
+    public void setJoinTeleportWarpName(String name) {
+        getConfig().set("join-teleport.warp", name);
+        saveConfig();
+    }
+
     public PortalManager getPortalManager() {
         return portalManager;
     }
@@ -259,11 +309,26 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
 
         this.warpKey = new NamespacedKey(this, "warp_id");
         this.worldKey = new NamespacedKey(this, "world_id");
+        this.pageActionKey = new NamespacedKey(this, "page_action");
 
 	this.portalManager = new PortalManager(this);
         getServer().getPluginManager().registerEvents(portalManager, this);
 
 	this.worldProfileManager = new WorldProfileManager(this);
+
+        this.backManager = new BackManager(this);
+        if (getCommand("back") != null) {
+            getCommand("back").setExecutor(this);
+        }
+
+        // /back writes happen far more often than warp edits, so flush periodically
+        // instead of on every single teleport.
+        getServer().getScheduler().runTaskTimerAsynchronously(
+                this,
+                () -> backManager.autoSaveIfDirty(),
+                6000L, // 5 minutes
+                6000L
+        );
 
         // Listeners for GUIs
         getServer().getPluginManager().registerEvents(new WarpsGuiListener(this), this);
@@ -432,6 +497,10 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
 
 	 if (worldProfileManager != null) {
             worldProfileManager.saveAllToDisk();
+        }
+
+        if (backManager != null) {
+            backManager.save();
         }
 
 
@@ -984,12 +1053,41 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
     return result;
 }
 
+    /**
+     * Same as tabCompleteMaterials, but also offers "hand" - used only for warp
+     * icon completion (/setwarp, /warp edit icon), not for consumers like
+     * /world create|edit icon which only ever accept a plain Material.
+     */
+    private List<String> tabCompleteWarpIcon(String partial) {
+        String p = partial == null ? "" : partial.toUpperCase(Locale.ROOT);
+        List<String> result = new ArrayList<>();
+        if ("HAND".startsWith(p)) {
+            result.add("hand");
+        }
+        result.addAll(tabCompleteMaterials(partial));
+        return result;
+    }
+
+    private List<String> tabCompleteCategories(String partial) {
+        if (warpManager == null) {
+            return Collections.emptyList();
+        }
+        String p = partial == null ? "" : partial.toLowerCase(Locale.ROOT);
+        List<String> result = new ArrayList<>();
+        for (String category : warpManager.getKnownCategories()) {
+            if (p.isEmpty() || category.toLowerCase(Locale.ROOT).startsWith(p)) {
+                result.add(category);
+            }
+        }
+        return result;
+    }
+
     private List<String> tabCompleteSetWarp(CommandSender sender, String[] args) {
         if (!(sender instanceof Player)) {
             return Collections.emptyList();
         }
 
-        // /setwarp <name> <public|private> [icon]
+        // /setwarp <name> <public|private> [icon|hand] [category]
         if (args.length == 2) {
             String partial = args[1].toLowerCase();
             List<String> options = new ArrayList<>();
@@ -999,8 +1097,11 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         }
 
         if (args.length == 3) {
-            // icon argument
-            return tabCompleteMaterials(args[2]);
+            return tabCompleteWarpIcon(args[2]);
+        }
+
+        if (args.length == 4) {
+            return tabCompleteCategories(args[3]);
         }
 
         return Collections.emptyList();
@@ -1011,24 +1112,50 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             return Collections.emptyList();
         }
 
-        // /warp edit <name> <rename|relocate|icon|order|delete> ...
+        // /warp edit <name> <rename|relocate|icon|order|category|delete> ...
+        // /warp jointp <on|off>
+        // /warp jointp warp <name>
         if (args.length == 1) {
-            // subcommand - we only support "edit" right now
             String partial = args[0].toLowerCase();
-            if ("edit".startsWith(partial)) {
-                return Collections.singletonList("edit");
+            List<String> subs = new ArrayList<>();
+            if ("edit".startsWith(partial)) subs.add("edit");
+            if ("jointp".startsWith(partial)) subs.add("jointp");
+            return subs;
+        }
+
+        if ("jointp".equalsIgnoreCase(args[0])) {
+            if (args.length == 2) {
+                String partial = args[1].toLowerCase(Locale.ROOT);
+                List<String> options = new ArrayList<>();
+                if ("on".startsWith(partial)) options.add("on");
+                if ("off".startsWith(partial)) options.add("off");
+                if ("warp".startsWith(partial)) options.add("warp");
+                return options;
+            }
+            if (args.length == 3 && "warp".equalsIgnoreCase(args[1])) {
+                String partial = args[2].toLowerCase(Locale.ROOT);
+                List<String> names = new ArrayList<>();
+                if (warpManager != null) {
+                    for (WarpManager.Warp w : warpManager.getPublicWarps()) {
+                        if (w.getName().toLowerCase(Locale.ROOT).startsWith(partial)) {
+                            names.add(w.getName());
+                        }
+                    }
+                }
+                return names;
             }
             return Collections.emptyList();
         }
 
         if (args.length == 3 && "edit".equalsIgnoreCase(args[0])) {
-            // edit subcommand name: <rename|relocate|icon|order|delete>
+            // edit subcommand name: <rename|relocate|icon|order|category|delete>
             String partial = args[2].toLowerCase();
             List<String> subs = new ArrayList<>();
             if ("rename".startsWith(partial))   subs.add("rename");
             if ("relocate".startsWith(partial)) subs.add("relocate");
             if ("icon".startsWith(partial))     subs.add("icon");
             if ("order".startsWith(partial))    subs.add("order");
+            if ("category".startsWith(partial)) subs.add("category");
             if ("delete".startsWith(partial))   subs.add("delete");
             return subs;
         }
@@ -1036,8 +1163,14 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         if (args.length == 4
                 && "edit".equalsIgnoreCase(args[0])
                 && "icon".equalsIgnoreCase(args[2])) {
-            // /warp edit <name> icon <material>
-            return tabCompleteMaterials(args[3]);
+            // /warp edit <name> icon <material|hand>
+            return tabCompleteWarpIcon(args[3]);
+        }
+
+        if (args.length == 4
+                && "edit".equalsIgnoreCase(args[0])
+                && "category".equalsIgnoreCase(args[2])) {
+            return tabCompleteCategories(args[3]);
         }
 
         return Collections.emptyList();
@@ -1665,6 +1798,36 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         return true;
     }
 
+    /**
+     * Resolves an icon argument for /setwarp or /warp edit icon: either the special
+     * "hand" keyword - which captures whatever item the player is holding, including
+     * a custom head's skin or a banner's color/pattern layers - or a plain material
+     * name as before. Returns null (after messaging the player) if it's invalid.
+     */
+    private ItemStack resolveIconArg(Player p, String arg) {
+        if (arg.equalsIgnoreCase("hand")) {
+            ItemStack held = p.getInventory().getItemInMainHand();
+            if (held.getType() == Material.AIR) {
+                p.sendMessage("§cYou're not holding anything to use as an icon.");
+                return null;
+            }
+            return held.clone();
+        }
+
+        Material m = Material.matchMaterial(arg);
+        if (m == null) {
+            p.sendMessage("§cUnknown material: §f" + arg);
+            p.sendMessage("§7Example: §eDIAMOND_SWORD§7, §eSTONE§7, or §ehand§7 to use your held item.");
+            return null;
+        }
+        if (!m.isItem()) {
+            p.sendMessage("§c" + m.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
+            p.sendMessage("§7Try something like §eLAVA_BUCKET§7 instead, or §ehand§7 to use your held item.");
+            return null;
+        }
+        return new ItemStack(m);
+    }
+
     private boolean handleSetWarp(CommandSender sender, String[] args) {
         if (!(sender instanceof Player p)) {
             sender.sendMessage("This command can only be used in-game.");
@@ -1672,7 +1835,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         }
 
         if (args.length < 2) {
-            p.sendMessage("§7Usage: §e/setwarp <name> <public|private> [icon]");
+            p.sendMessage("§7Usage: §e/setwarp <name> <public|private> [icon|hand] [category]");
             return true;
         }
 
@@ -1699,20 +1862,20 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             }
         }
 
-        Material icon = Material.DIRT;
+        ItemStack icon = new ItemStack(Material.DIRT);
         if (args.length >= 3) {
-            Material m = Material.matchMaterial(args[2]);
-            if (m == null) {
-                p.sendMessage("§cUnknown material: §f" + args[2]);
-                p.sendMessage("§7Example: §eDIAMOND_SWORD§7 or §eSTONE");
+            ItemStack resolved = resolveIconArg(p, args[2]);
+            if (resolved == null) return true;
+            icon = resolved;
+        }
+
+        String category = WarpManager.DEFAULT_CATEGORY;
+        if (args.length >= 4) {
+            category = String.join(" ", Arrays.copyOfRange(args, 3, args.length)).trim();
+            if (category.length() > 32) {
+                p.sendMessage("§cCategory name is too long (max 32 characters).");
                 return true;
             }
-            if (!m.isItem()) {
-                p.sendMessage("§c" + m.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
-                p.sendMessage("§7Try something like §eLAVA_BUCKET§7 instead.");
-                return true;
-            }
-            icon = m;
         }
 
         if (warpManager == null) {
@@ -1725,20 +1888,22 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             if (existing != null) {
                 warpManager.updateWarpLocation(existing, p.getLocation());
                 warpManager.updateWarpIcon(existing, icon);
+                warpManager.updateWarpCategory(existing, category);
                 p.sendMessage("§aUpdated public warp §e" + name + "§a at your current location.");
             } else {
-                warpManager.createWarp(p.getUniqueId(), true, name, p.getLocation(), icon);
-                p.sendMessage("§aCreated new public warp §e" + name + "§a.");
+                warpManager.createWarp(p.getUniqueId(), true, name, p.getLocation(), icon, category);
+                p.sendMessage("§aCreated new public warp §e" + name + "§a in category §e" + category + "§a.");
             }
         } else {
             WarpManager.Warp existing = warpManager.getPrivateWarp(p.getUniqueId(), name);
             if (existing != null) {
                 warpManager.updateWarpLocation(existing, p.getLocation());
                 warpManager.updateWarpIcon(existing, icon);
+                warpManager.updateWarpCategory(existing, category);
                 p.sendMessage("§aUpdated your private warp §e" + name + "§a.");
             } else {
-                warpManager.createWarp(p.getUniqueId(), false, name, p.getLocation(), icon);
-                p.sendMessage("§aCreated new private warp §e" + name + "§a.");
+                warpManager.createWarp(p.getUniqueId(), false, name, p.getLocation(), icon, category);
+                p.sendMessage("§aCreated new private warp §e" + name + "§a in category §e" + category + "§a.");
             }
         }
 
@@ -1767,6 +1932,61 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         return true;
     }
 
+    private boolean handleWarpCommand(CommandSender sender, String[] args) {
+        if (args.length >= 1 && args[0].equalsIgnoreCase("jointp")) {
+            return handleJoinTp(sender, args);
+        }
+        return handleWarpEdit(sender, args);
+    }
+
+    private boolean handleJoinTp(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (requireStaffStyle(p) == null) {
+            return true;
+        }
+
+        // /warp jointp                -> show status
+        // /warp jointp <on|off>       -> toggle
+        // /warp jointp warp <name>    -> set target public warp
+        if (args.length == 1) {
+            p.sendMessage("§7Join-teleport is currently: "
+                    + (isJoinTeleportEnabled() ? "§aON" : "§cOFF")
+                    + "§7, target warp: §e" + getJoinTeleportWarpName());
+            p.sendMessage("§7Usage: §e/warp jointp <on|off>§7 or §e/warp jointp warp <name>");
+            return true;
+        }
+
+        String sub = args[1].toLowerCase(Locale.ROOT);
+
+        if (sub.equals("on") || sub.equals("off")) {
+            boolean enable = sub.equals("on");
+            setJoinTeleportEnabled(enable);
+            p.sendMessage("§aJoin-teleport is now " + (enable ? "§aON" : "§cOFF") + "§a.");
+            return true;
+        }
+
+        if (sub.equals("warp")) {
+            if (args.length < 3) {
+                p.sendMessage("§7Usage: §e/warp jointp warp <name>");
+                return true;
+            }
+            String warpName = args[2];
+            if (warpManager == null || warpManager.getPublicWarp(warpName) == null) {
+                p.sendMessage("§cNo public warp named §e" + warpName + "§c found. Join-teleport must target a public warp.");
+                return true;
+            }
+            setJoinTeleportWarpName(warpName);
+            p.sendMessage("§aJoin-teleport target warp set to §e" + warpName + "§a.");
+            return true;
+        }
+
+        p.sendMessage("§7Usage: §e/warp jointp <on|off>§7 or §e/warp jointp warp <name>");
+        return true;
+    }
+
     private boolean handleWarpEdit(CommandSender sender, String[] args) {
         if (!(sender instanceof Player p)) {
             sender.sendMessage("This command can only be used in-game.");
@@ -1779,7 +1999,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         }
 
         if (args.length < 2 || !args[0].equalsIgnoreCase("edit")) {
-            p.sendMessage("§7Usage: §e/warp edit <name> <rename|relocate|icon|order|delete> ...");
+            p.sendMessage("§7Usage: §e/warp edit <name> <rename|relocate|icon|order|category|delete> ...");
             return true;
         }
 
@@ -1817,7 +2037,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         }
 
         if (args.length < 3) {
-            p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|delete> ...");
+            p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|category|delete> ...");
             return true;
         }
 
@@ -1861,20 +2081,12 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             }
             case "icon": {
                 if (args.length < 4) {
-                    p.sendMessage("§7Usage: §e/warp edit " + name + " icon <material>");
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " icon <material|hand>");
                     return true;
                 }
-                Material mat = Material.matchMaterial(args[3]);
-                if (mat == null) {
-                    p.sendMessage("§cUnknown material: §f" + args[3]);
-                    return true;
-                }
-                if (!mat.isItem()) {
-                    p.sendMessage("§c" + mat.name() + " is not a valid item (e.g. fluids like LAVA cannot be icons).");
-                    p.sendMessage("§7Use an actual item like §eLAVA_BUCKET§7, §eNETHERRACK§7, etc.");
-                    return true;
-                }
-                warpManager.updateWarpIcon(warp, mat);
+                ItemStack resolved = resolveIconArg(p, args[3]);
+                if (resolved == null) return true;
+                warpManager.updateWarpIcon(warp, resolved);
                 warpManager.save();
                 p.sendMessage("§aUpdated icon for warp §e" + warp.getName() + "§a.");
                 break;
@@ -1897,6 +2109,21 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 p.sendMessage("§aUpdated GUI order for warp §e" + warp.getName() + "§a to §e" + order + "§a.");
                 break;
             }
+            case "category": {
+                if (args.length < 4) {
+                    p.sendMessage("§7Usage: §e/warp edit " + name + " category <categoryName>");
+                    return true;
+                }
+                String newCategory = String.join(" ", Arrays.copyOfRange(args, 3, args.length)).trim();
+                if (newCategory.length() > 32) {
+                    p.sendMessage("§cCategory name is too long (max 32 characters).");
+                    return true;
+                }
+                warpManager.updateWarpCategory(warp, newCategory);
+                warpManager.save();
+                p.sendMessage("§aWarp §e" + warp.getName() + "§a moved to category §e" + warp.getCategory() + "§a.");
+                break;
+            }
             case "delete": {
                 warpManager.deleteWarp(warp);
                 warpManager.save();
@@ -1904,10 +2131,44 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 break;
             }
             default: {
-                p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|delete> ...");
+                p.sendMessage("§7Usage: §e/warp edit " + name + " <rename|relocate|icon|order|category|delete> ...");
                 break;
             }
         }
+
+        return true;
+    }
+
+    private boolean handleBack(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("This command can only be used in-game.");
+            return true;
+        }
+        if (backManager == null) {
+            p.sendMessage("§cBack-location tracking is not initialized.");
+            return true;
+        }
+
+        Location loc = backManager.getBackLocation(p.getUniqueId());
+        if (loc == null) {
+            p.sendMessage("§7You have no previous location to return to.");
+            return true;
+        }
+
+        p.addPotionEffect(new PotionEffect(
+                PotionEffectType.BLINDNESS,
+                25,
+                1,
+                false,
+                false,
+                false
+        ));
+        p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_BELL, 1.0f, 1.0f);
+
+        getServer().getScheduler().runTaskLater(this, () -> {
+            p.teleport(loc);
+            p.sendMessage("§aTeleported back to your previous location.");
+        }, 3L);
 
         return true;
     }
@@ -2184,6 +2445,8 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             worldProfileManager.handleJoin(p);
         }
 
+        maybeJoinTeleport(p);
+
         UUID uuid = p.getUniqueId();
         for (String msg : friendManager.drainNotifications(uuid)) {
             p.sendMessage(msg);
@@ -2197,6 +2460,61 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 friend.sendMessage("§aYour friend §e" + p.getName() + " §ahas joined the game.");
             }
         }
+    }
+
+    /**
+     * If join-teleport is enabled (see /warp jointp), teleports a freshly-joined
+     * player to the configured public warp, with the same blindness+bell effect
+     * used for the warps GUI. Silently does nothing if it's disabled, or if the
+     * configured warp doesn't exist / its world isn't loaded (logged instead of
+     * spamming the player with an error on every join).
+     */
+    private void maybeJoinTeleport(Player p) {
+        if (warpManager == null || !isJoinTeleportEnabled()) return;
+
+        String warpName = getJoinTeleportWarpName();
+        WarpManager.Warp warp = warpManager.getPublicWarp(warpName);
+        if (warp == null) {
+            getLogger().warning("join-teleport is enabled but public warp '" + warpName + "' does not exist.");
+            return;
+        }
+
+        Location loc = warpManager.toLocation(warp);
+        if (loc == null) {
+            getLogger().warning("join-teleport target warp '" + warpName + "' is in a world that isn't loaded.");
+            return;
+        }
+
+        p.addPotionEffect(new PotionEffect(
+                PotionEffectType.BLINDNESS,
+                25,
+                1,
+                false,
+                false,
+                false
+        ));
+        p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_BELL, 1.0f, 0.7f);
+
+        getServer().getScheduler().runTaskLater(
+                this,
+                () -> p.teleport(loc),
+                3L
+        );
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onPlayerTeleport(PlayerTeleportEvent e) {
+        if (backManager == null) return;
+
+        // Spectate-mode "teleports" fire continuously while clicking through players -
+        // recording those would make /back useless (it'd just point at wherever you
+        // were last spectating from a moment ago).
+        if (e.getCause() == PlayerTeleportEvent.TeleportCause.SPECTATE) return;
+
+        Location from = e.getFrom();
+        if (from.getWorld() == null) return;
+
+        backManager.recordBackLocation(e.getPlayer().getUniqueId(), from);
     }
 
     @EventHandler
@@ -2728,7 +3046,9 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             case "warps":
                 return handleWarps(sender, args);
             case "warp":
-                return handleWarpEdit(sender, args);
+                return handleWarpCommand(sender, args);
+            case "back":
+                return handleBack(sender, args);
             case "worlds":
                 return handleWorlds(sender, args);
             case "world":
@@ -2739,6 +3059,12 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 return handlePortals(sender, args);
             case "exit_mode":
                 return handleExitMode(sender, args);
+            case "ftp":
+                if (!(sender instanceof Player p)) {
+                    sender.sendMessage("This command can only be used in-game.");
+                    return true;
+                }
+                return handleFriendTeleport(p, args);
 	    default:
                 return false;
         }

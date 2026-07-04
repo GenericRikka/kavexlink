@@ -6,6 +6,7 @@ import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.inventory.ItemStack;
 
 import java.io.File;
 import java.util.*;
@@ -13,6 +14,7 @@ import java.util.*;
 public class WarpManager {
 
     public static final String PUBLIC_OWNER = "PUBLIC";
+    public static final String DEFAULT_CATEGORY = "General";
 
     private final KavexLinkPlugin plugin;
     private final File file;
@@ -28,6 +30,12 @@ public class WarpManager {
 
     private String makeKey(String ownerId, String name) {
         return ownerId.toLowerCase() + "::" + name.toLowerCase();
+    }
+
+    private static String normalizeCategory(String category) {
+        if (category == null) return DEFAULT_CATEGORY;
+        String trimmed = category.trim();
+        return trimmed.isEmpty() ? DEFAULT_CATEGORY : trimmed;
     }
 
     public void load() {
@@ -58,11 +66,27 @@ public class WarpManager {
             float yaw = (float) config.getDouble(base + "yaw", 0.0D);
             float pitch = (float) config.getDouble(base + "pitch", 0.0D);
 
-            String iconName = config.getString(base + "icon", "DIRT");
-            Material icon = Material.matchMaterial(iconName);
-            if (icon == null) icon = Material.DIRT;
+            // Icons used to be stored as a bare material name (icon: DIRT). Custom
+            // heads/banners captured via "hand" are stored as a full serialized
+            // ItemStack instead, which YamlConfiguration deserializes for us
+            // automatically - so a plain Object read here is either a String
+            // (legacy) or already an ItemStack (new format).
+            Object rawIcon = config.get(base + "icon");
+            ItemStack icon;
+            if (rawIcon instanceof ItemStack) {
+                icon = (ItemStack) rawIcon;
+            } else {
+                String iconName = rawIcon instanceof String ? (String) rawIcon : "DIRT";
+                Material iconMat = Material.matchMaterial(iconName);
+                if (iconMat == null) iconMat = Material.DIRT;
+                icon = new ItemStack(iconMat);
+            }
 
             int order = config.getInt(base + "order", 0);
+
+            // Warps saved before category support existed won't have this key -
+            // normalizeCategory() falls back to DEFAULT_CATEGORY for those.
+            String category = normalizeCategory(config.getString(base + "category"));
 
             if (name == null || world == null) {
                 continue;
@@ -71,7 +95,7 @@ public class WarpManager {
             Warp w = new Warp(
                     id, name, owner, isPublic,
                     world, x, y, z, yaw, pitch,
-                    icon, order
+                    icon, order, category
             );
             warpsById.put(id, w);
             warpsByKey.put(makeKey(owner, name), w);
@@ -94,8 +118,9 @@ public class WarpManager {
             out.set(base + "z", w.getZ());
             out.set(base + "yaw", w.getYaw());
             out.set(base + "pitch", w.getPitch());
-            out.set(base + "icon", w.getIcon().name());
+            out.set(base + "icon", w.getIcon());
             out.set(base + "order", w.getOrder());
+            out.set(base + "category", w.getCategory());
         }
 
         try {
@@ -115,14 +140,16 @@ public class WarpManager {
         return max + 1;
     }
 
-    public Warp createWarp(UUID ownerUuid, boolean publicWarp, String name, Location loc, Material icon) {
+    public Warp createWarp(UUID ownerUuid, boolean publicWarp, String name, Location loc, ItemStack icon, String category) {
         String ownerStr = publicWarp ? PUBLIC_OWNER : ownerUuid.toString();
         String key = makeKey(ownerStr, name);
+        String normalizedCategory = normalizeCategory(category);
 
         Warp existing = warpsByKey.get(key);
         if (existing != null) {
             updateWarpLocation(existing, loc);
             updateWarpIcon(existing, icon);
+            updateWarpCategory(existing, normalizedCategory);
             return existing;
         }
 
@@ -141,7 +168,8 @@ public class WarpManager {
                 loc.getX(), loc.getY(), loc.getZ(),
                 loc.getYaw(), loc.getPitch(),
                 icon,
-                order
+                order,
+                normalizedCategory
         );
         warpsById.put(id, w);
         warpsByKey.put(key, w);
@@ -156,14 +184,52 @@ public class WarpManager {
         return warpsByKey.get(makeKey(owner.toString(), name));
     }
 
+    /**
+     * Orders categories per the config's `category-order` list (case-insensitive,
+     * trimmed); any category not listed falls after all listed ones, sorted
+     * alphabetically. With an empty/missing list, everything just sorts
+     * alphabetically. Built fresh each time so config reloads take effect without
+     * needing a restart.
+     */
+    private Comparator<String> categoryComparator() {
+        List<String> configured = plugin.getConfig().getStringList("category-order");
+        Map<String, Integer> rank = new HashMap<>();
+        int i = 0;
+        for (String c : configured) {
+            if (c == null) continue;
+            String key = c.trim().toLowerCase(Locale.ROOT);
+            if (key.isEmpty()) continue;
+            rank.putIfAbsent(key, i++);
+        }
+
+        return (a, b) -> {
+            Integer ra = rank.get(a.toLowerCase(Locale.ROOT));
+            Integer rb = rank.get(b.toLowerCase(Locale.ROOT));
+            if (ra != null && rb != null) return Integer.compare(ra, rb);
+            if (ra != null) return -1; // a is listed, b isn't -> a comes first
+            if (rb != null) return 1;  // b is listed, a isn't -> b comes first
+            return a.compareToIgnoreCase(b); // neither listed -> alphabetical
+        };
+    }
+
+    private Comparator<Warp> categoryOrderNameComparator() {
+        return Comparator.comparing(Warp::getCategory, categoryComparator())
+                .thenComparingInt(Warp::getOrder)
+                .thenComparing(Warp::getName, String.CASE_INSENSITIVE_ORDER);
+    }
+
+    /**
+     * Public warps sorted by category (per config's category-order, or
+     * alphabetically), then by order within that category, then by name. Warps
+     * sharing a category always end up contiguous in this list, which is what lets
+     * the GUI chunk them into category-exclusive pages without any extra bookkeeping.
+     */
     public List<Warp> getPublicWarps() {
         List<Warp> list = new ArrayList<>();
         for (Warp w : warpsById.values()) {
             if (w.isPublicWarp()) list.add(w);
         }
-        list.sort(Comparator
-                .comparingInt(Warp::getOrder)
-                .thenComparing(Warp::getName, String.CASE_INSENSITIVE_ORDER));
+        list.sort(categoryOrderNameComparator());
         return list;
     }
 
@@ -175,8 +241,20 @@ public class WarpManager {
                 list.add(w);
             }
         }
-        list.sort(Comparator.comparing(Warp::getName, String.CASE_INSENSITIVE_ORDER));
+        list.sort(categoryOrderNameComparator());
         return list;
+    }
+
+    /**
+     * Distinct category names currently in use, across both public and private warps -
+     * handy for tab-completing /setwarp and /warp edit category.
+     */
+    public List<String> getKnownCategories() {
+        TreeSet<String> categories = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (Warp w : warpsById.values()) {
+            categories.add(w.getCategory());
+        }
+        return new ArrayList<>(categories);
     }
 
     public Warp getWarpById(String id) {
@@ -203,12 +281,16 @@ public class WarpManager {
         warp.setPitch(loc.getPitch());
     }
 
-    public void updateWarpIcon(Warp warp, Material icon) {
+    public void updateWarpIcon(Warp warp, ItemStack icon) {
         warp.setIcon(icon);
     }
 
     public void updateWarpOrder(Warp warp, int order) {
         warp.setOrder(order);
+    }
+
+    public void updateWarpCategory(Warp warp, String category) {
+        warp.setCategory(normalizeCategory(category));
     }
 
     public Location toLocation(Warp warp) {
@@ -225,8 +307,9 @@ public class WarpManager {
         private String world;
         private double x, y, z;
         private float yaw, pitch;
-        private Material icon;
+        private ItemStack icon;
         private int order;
+        private String category;
 
         public Warp(String id,
                     String name,
@@ -238,8 +321,9 @@ public class WarpManager {
                     double z,
                     float yaw,
                     float pitch,
-                    Material icon,
-                    int order) {
+                    ItemStack icon,
+                    int order,
+                    String category) {
             this.id = id;
             this.name = name;
             this.owner = owner;
@@ -252,6 +336,7 @@ public class WarpManager {
             this.pitch = pitch;
             this.icon = icon;
             this.order = order;
+            this.category = normalizeCategory(category);
         }
 
         public String getId() { return id; }
@@ -264,10 +349,11 @@ public class WarpManager {
         public double getZ() { return z; }
         public float getYaw() { return yaw; }
         public float getPitch() { return pitch; }
-        public Material getIcon() { return icon; }
+        public ItemStack getIcon() { return icon; }
         public int getOrder() { return order; }
+        public String getCategory() { return category; }
 
-	public Location getLocation() {
+        public Location getLocation() {
             World w = Bukkit.getWorld(this.world);
             if (w == null) {
                 return null;
@@ -282,8 +368,8 @@ public class WarpManager {
         private void setZ(double z) { this.z = z; }
         private void setYaw(float yaw) { this.yaw = yaw; }
         private void setPitch(float pitch) { this.pitch = pitch; }
-        private void setIcon(Material icon) { this.icon = icon; }
+        private void setIcon(ItemStack icon) { this.icon = icon; }
         private void setOrder(int order) { this.order = order; }
+        private void setCategory(String category) { this.category = category; }
     }
 }
-

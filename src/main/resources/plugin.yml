@@ -8,6 +8,8 @@ commands:
   linkdiscord:
     description: Link your Minecraft account with Discord
     usage: "/linkdiscord"
+    permission: kavexlink.command.linkdiscord
+    permission-message: §c You do not have permission to use /linkdiscord.
   kavexkick:
     description: Kick a player using Discord permissions
     usage: "/kavexkick <player> [reason]"
@@ -49,13 +51,18 @@ commands:
     usage: "/notifyping <on|off>"
   setwarp:
     description: Create or update a warp at your current position
-    usage: /setwarp <name> <public|private> [icon]
+    usage: /setwarp <name> <public|private> [icon|hand] [category]
   warps:
     description: Open the warps GUI
     usage: /warps [public|private]
   warp:
-    description: Edit an existing warp
-    usage: /warp edit <name> <rename|relocate|icon|order|delete> ...
+    description: Edit an existing warp, or manage join-teleport
+    usage: /warp edit <name> <rename|relocate|icon|order|category|delete> ... | /warp jointp <on|off> | /warp jointp warp <name>
+  back:
+    description: Return to your location before your last teleport
+    usage: /back
+    permission: kavexlink.command.back
+    permission-message: §cYou do not have permission to use /back.
   worlds:
     description: Open worlds GUI
     usage: /worlds
@@ -76,3 +83,11 @@ commands:
     usage: /ftp <player>
     permission: kavexlink.command.ftp
     permission-message: §cYou do not have permission to use friend teleportation.
+
+permissions:
+  kavexlink.command.back:
+    description: Allows using /back to return to your location before your last teleport.
+    default: true
+  kavexlink.command.linkdiscord:
+    default: true
+

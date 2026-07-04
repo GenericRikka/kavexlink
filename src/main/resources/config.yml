@@ -27,3 +27,14 @@ friends:
   dm-history-days: 30
   allow-friend-teleport: true     # If true, reciprocal friends can use /ftp <name>
   teleport-cooldown-seconds: 60   # Anti-spam interval threshold
+
+# Controls the order categories appear in in /warps [public|private] (case-insensitive,
+# top to bottom). Categories not listed here are sorted alphabetically after any
+# listed ones. Leave empty for plain alphabetical ordering of every category.
+category-order: []
+
+# Auto-teleports players to a public warp on join. Toggle and target warp are also
+# managed in-game via /warp jointp <on|off> and /warp jointp warp <name>.
+join-teleport:
+  enabled: false
+  warp: "spawn"
