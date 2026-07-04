@@ -38,3 +38,35 @@ category-order: []
 join-teleport:
   enabled: false
   warp: "spawn"
+
+# Breaks the rest of a tree's trunk when a player breaks any log that's part of it,
+# so half-chopped trunks don't get left floating in the air. Only connected log
+# blocks of the SAME wood type are removed - leaves are never touched and just
+# decay on their own afterwards, same as vanilla.
+tree-felling:
+  enabled: true
+
+  # Only fells if at least one leaves block (or nether wart block, for crimson/warped
+  # huge fungi) is found within leaves-search-radius of the trunk. This is what tells
+  # a real tree apart from a player-built log structure (e.g. a log cabin), which
+  # normally won't have leaves stuck to it. Turn off only if this is misfiring/missing
+  # too often on your world's tree shapes.
+  require-leaves-nearby: true
+  leaves-search-radius: 3
+
+  # Safety/performance cap on how many logs can be removed for a single break.
+  # 128 comfortably covers even a full-height jungle giant's 2x2 trunk.
+  max-tree-size: 128
+
+  # Matches diagonal trunk offsets (common on acacia and jungle trees) in addition
+  # to straight up/down/sideways connections. Turn off for strict orthogonal-only
+  # matching.
+  diagonal-connections: true
+
+  # If true, felling only triggers when the block is broken with an axe.
+  require-axe: false
+
+  # If true, sneaking while breaking a log skips felling entirely, letting players
+  # pull individual logs out of a tree (or a log-built structure) without taking the
+  # rest down - handy for builders working with logs decoratively.
+  sneak-to-disable: true

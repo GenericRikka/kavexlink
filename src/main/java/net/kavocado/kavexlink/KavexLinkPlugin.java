@@ -334,6 +334,9 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
         getServer().getPluginManager().registerEvents(new WarpsGuiListener(this), this);
         getServer().getPluginManager().registerEvents(new WorldsGuiListener(this), this);
 
+        // Fells the rest of a tree's trunk when a player breaks one of its logs
+        getServer().getPluginManager().registerEvents(new TreeFellListener(this), this);
+
         // Moderation storage
         this.moderationFile = dataDir.resolve("moderation.yml").toFile();
         this.moderationConfig = YamlConfiguration.loadConfiguration(moderationFile);
