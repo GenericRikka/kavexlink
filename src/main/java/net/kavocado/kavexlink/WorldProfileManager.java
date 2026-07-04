@@ -2,6 +2,7 @@ package net.kavocado.kavexlink;
 
 import org.bukkit.World;
 import org.bukkit.GameMode;
+import org.bukkit.Location;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
@@ -63,6 +64,9 @@ public class WorldProfileManager {
     // player UUID -> (profileKey -> stats profile)
     private final Map<UUID, Map<String, StatsProfile>> statsProfiles = new ConcurrentHashMap<>();
 
+    // player UUID -> (Bukkit world name, lowercase -> last known position in that world)
+    private final Map<UUID, Map<String, LastLocation>> lastLocations = new ConcurrentHashMap<>();
+
     // Tracks which players' on-disk profile data has already been loaded into
     // the maps above this session, so we only hit disk once per player.
     private final Set<UUID> loadedFromDisk = ConcurrentHashMap.newKeySet();
@@ -91,6 +95,11 @@ public class WorldProfileManager {
         int level;
     }
 
+    static class LastLocation {
+        double x, y, z;
+        float yaw, pitch;
+    }
+
     // --------- Helpers ---------
 
     private WorldManager worldManager() {
@@ -105,6 +114,11 @@ public class WorldProfileManager {
     private Map<String, StatsProfile> statsFor(UUID id) {
         loadFromDiskIfNeeded(id);
         return statsProfiles.computeIfAbsent(id, k -> new ConcurrentHashMap<>());
+    }
+
+    private Map<String, LastLocation> locationsFor(UUID id) {
+        loadFromDiskIfNeeded(id);
+        return lastLocations.computeIfAbsent(id, k -> new ConcurrentHashMap<>());
     }
 
     private String inventoryProfileKey(WorldManager.WorldEntry entry) {
@@ -172,6 +186,42 @@ public class WorldProfileManager {
         for (UUID id : statsProfiles.keySet()) {
             savePlayerDataToDisk(id);
         }
+        for (UUID id : lastLocations.keySet()) {
+            savePlayerDataToDisk(id);
+        }
+    }
+
+    /**
+     * Records where a player was standing right before leaving a world, so a later
+     * /worlds or /world tp visit to that same world can put them back there instead
+     * of always defaulting to world spawn. Called from the plugin's PlayerTeleportEvent
+     * listener whenever a teleport crosses from one world into another.
+     */
+    public void recordWorldLocation(UUID id, Location loc) {
+        if (loc == null || loc.getWorld() == null) return;
+
+        LastLocation stored = new LastLocation();
+        stored.x = loc.getX();
+        stored.y = loc.getY();
+        stored.z = loc.getZ();
+        stored.yaw = loc.getYaw();
+        stored.pitch = loc.getPitch();
+
+        locationsFor(id).put(loc.getWorld().getName().toLowerCase(Locale.ROOT), stored);
+    }
+
+    /**
+     * The player's last known position in the given (already-loaded) world, or null
+     * if none has been recorded yet - callers should fall back to world spawn in
+     * that case.
+     */
+    public Location getLastLocation(UUID id, World world) {
+        if (world == null) return null;
+
+        LastLocation stored = locationsFor(id).get(world.getName().toLowerCase(Locale.ROOT));
+        if (stored == null) return null;
+
+        return new Location(world, stored.x, stored.y, stored.z, stored.yaw, stored.pitch);
     }
 
     // --------- Internals: leaving a world ---------
@@ -462,15 +512,35 @@ public class WorldProfileManager {
                 map.put(key, prof);
             }
         }
+
+        ConfigurationSection locSec = cfg.getConfigurationSection("locations");
+        if (locSec != null) {
+            Map<String, LastLocation> map =
+                    lastLocations.computeIfAbsent(id, k -> new ConcurrentHashMap<>());
+            for (String key : locSec.getKeys(false)) {
+                ConfigurationSection ksec = locSec.getConfigurationSection(key);
+                if (ksec == null) continue;
+
+                LastLocation loc = new LastLocation();
+                loc.x = ksec.getDouble("x", 0.0);
+                loc.y = ksec.getDouble("y", 0.0);
+                loc.z = ksec.getDouble("z", 0.0);
+                loc.yaw = (float) ksec.getDouble("yaw", 0.0);
+                loc.pitch = (float) ksec.getDouble("pitch", 0.0);
+                map.put(key, loc);
+            }
+        }
     }
 
     private void savePlayerDataToDisk(UUID id) {
         Map<String, InventoryProfile> invMap = inventoryProfiles.get(id);
         Map<String, StatsProfile> statMap = statsProfiles.get(id);
+        Map<String, LastLocation> locMap = lastLocations.get(id);
 
         boolean hasInv = invMap != null && !invMap.isEmpty();
         boolean hasStats = statMap != null && !statMap.isEmpty();
-        if (!hasInv && !hasStats) {
+        boolean hasLoc = locMap != null && !locMap.isEmpty();
+        if (!hasInv && !hasStats && !hasLoc) {
             return;
         }
 
@@ -496,6 +566,18 @@ public class WorldProfileManager {
                 cfg.set(base + "totalExp", prof.totalExp);
                 cfg.set(base + "exp", (double) prof.exp);
                 cfg.set(base + "level", prof.level);
+            }
+        }
+
+        if (hasLoc) {
+            for (Map.Entry<String, LastLocation> e : locMap.entrySet()) {
+                String base = "locations." + e.getKey() + ".";
+                LastLocation loc = e.getValue();
+                cfg.set(base + "x", loc.x);
+                cfg.set(base + "y", loc.y);
+                cfg.set(base + "z", loc.z);
+                cfg.set(base + "yaw", (double) loc.yaw);
+                cfg.set(base + "pitch", (double) loc.pitch);
             }
         }
 

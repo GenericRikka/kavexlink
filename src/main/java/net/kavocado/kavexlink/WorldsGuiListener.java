@@ -130,7 +130,14 @@ public class WorldsGuiListener implements Listener {
         plugin.getServer().getScheduler().runTaskLater(
                 plugin,
                 () -> {
-                    p.teleport(world.getSpawnLocation());
+                    org.bukkit.Location loc = null;
+                    if (entry.isReturnToLastLocation() && plugin.getWorldProfileManager() != null) {
+                        loc = plugin.getWorldProfileManager().getLastLocation(p.getUniqueId(), world);
+                    }
+                    if (loc == null) {
+                        loc = world.getSpawnLocation();
+                    }
+                    p.teleport(loc);
                     p.sendMessage("§aSwitched to world §e" + entry.getName() + "§a.");
                 },
                 3L // ~0.15s delay for black frame effect

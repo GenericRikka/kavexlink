@@ -81,6 +81,7 @@ public class WorldManager {
         private boolean resetHungerOnEnter;    // simple reset variant
         private boolean separateInventory;     // full separate inventory
         private boolean separateStats;         // full separate health/hunger/xp
+        private boolean returnToLastLocation;  // true = remember last position in this world; false = always spawn
 
         public WorldEntry(String name,
                           boolean builtin,
@@ -102,6 +103,7 @@ public class WorldManager {
             this.resetHungerOnEnter = false;
             this.separateInventory = false;
             this.separateStats = false;
+            this.returnToLastLocation = true;     // keep last known position unless configured otherwise
         }
 
         public String getName() {
@@ -192,6 +194,14 @@ public class WorldManager {
             this.separateStats = separateStats;
         }
 
+        public boolean isReturnToLastLocation() {
+            return returnToLastLocation;
+        }
+
+        public void setReturnToLastLocation(boolean returnToLastLocation) {
+            this.returnToLastLocation = returnToLastLocation;
+        }
+
         void setOrder(int order) {
             if (order < 0) order = 0;
             this.order = order;
@@ -246,6 +256,7 @@ public class WorldManager {
             boolean resetHunger     = wsec.getBoolean("reset_hunger_on_enter", false);
             boolean separateInv     = wsec.getBoolean("separate_inventory", false);
             boolean separateStats   = wsec.getBoolean("separate_stats", false);
+            boolean returnToLast    = wsec.getBoolean("return_to_last_location", true);
 
                
 	    Mode mode = Mode.fromStringOrId(modeStr);
@@ -273,6 +284,7 @@ public class WorldManager {
             entry.setResetHungerOnEnter(resetHunger);
             entry.setSeparateInventory(separateInv);
             entry.setSeparateStats(separateStats);
+            entry.setReturnToLastLocation(returnToLast);
 
             worlds.put(key(name), entry);
         }
@@ -307,6 +319,7 @@ public class WorldManager {
             wsec.set("reset_hunger_on_enter", e.isResetHungerOnEnter());
             wsec.set("separate_inventory", e.isSeparateInventory());
             wsec.set("separate_stats", e.isSeparateStats());
+            wsec.set("return_to_last_location", e.isReturnToLastLocation());
         }
 
         cfg.save(metaFile);
@@ -505,6 +518,7 @@ public class WorldManager {
         replacement.setResetHungerOnEnter(entry.isResetHungerOnEnter());
         replacement.setSeparateInventory(entry.isSeparateInventory());
         replacement.setSeparateStats(entry.isSeparateStats());
+        replacement.setReturnToLastLocation(entry.isReturnToLastLocation());
 
         worlds.remove(oldKey);
         worlds.put(newKey, replacement);

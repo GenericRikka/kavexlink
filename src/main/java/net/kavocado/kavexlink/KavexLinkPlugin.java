@@ -1248,7 +1248,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             return Collections.emptyList();
         }
 
-        // /world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...
+        // /world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode|position> ...
         if (sub.equals("edit")) {
             if (args.length == 3) {
                 // action
@@ -1263,6 +1263,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 if ("stats".startsWith(partial))    actions.add("stats");
                 if ("reset".startsWith(partial))    actions.add("reset");
                 if ("gamemode".startsWith(partial)) actions.add("gamemode");
+                if ("position".startsWith(partial)) actions.add("position");
                 return actions;
             }
 
@@ -1296,6 +1297,10 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                         if ("adventure".startsWith(partial)) out.add("adventure");
                         if ("spectator".startsWith(partial)) out.add("spectator");
                         if ("inherit".startsWith(partial))   out.add("inherit");
+                    }
+                    case "position" -> {
+                        if ("last".startsWith(partial))  out.add("last");
+                        if ("spawn".startsWith(partial)) out.add("spawn");
                     }
                     default -> {
                         // rename/order/delete don't really have good completions here
@@ -2504,17 +2509,31 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
 
     @EventHandler(ignoreCancelled = true)
     public void onPlayerTeleport(PlayerTeleportEvent e) {
-        if (backManager == null) return;
-
         // Spectate-mode "teleports" fire continuously while clicking through players -
-        // recording those would make /back useless (it'd just point at wherever you
-        // were last spectating from a moment ago).
+        // recording those would make /back (and world-return) useless, since they'd
+        // just point at wherever you were last spectating from a moment ago.
         if (e.getCause() == PlayerTeleportEvent.TeleportCause.SPECTATE) return;
 
         Location from = e.getFrom();
         if (from.getWorld() == null) return;
 
-        backManager.recordBackLocation(e.getPlayer().getUniqueId(), from);
+        if (backManager != null) {
+            backManager.recordBackLocation(e.getPlayer().getUniqueId(), from);
+        }
+
+        // Remember exactly where the player was in the world they're leaving,
+        // so a later /worlds or /world tp visit to that world can put them back
+        // there instead of always defaulting to world spawn. Covers portal use
+        // as well as /worlds and /world tp, since all of those go through a
+        // normal teleport.
+        if (worldProfileManager != null) {
+            Location to = e.getTo();
+            boolean crossedWorlds = to == null || to.getWorld() == null
+                    || !to.getWorld().equals(from.getWorld());
+            if (crossedWorlds) {
+                worldProfileManager.recordWorldLocation(e.getPlayer().getUniqueId(), from);
+            }
+        }
     }
 
     @EventHandler
@@ -3213,7 +3232,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
             sender.sendMessage("§7World commands:");
             sender.sendMessage("§e/world create <name> <mode> <access> [icon] [seed...]");
             sender.sendMessage("§e/world tp <name> [player]");
-            sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+            sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode|position> ...");
             sender.sendMessage("§7  mode: §fdefault|flat|large (or 1/2/3)");
             sender.sendMessage("§7  access: §fpublic|private");
             return true;
@@ -3358,7 +3377,13 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                     return true;
                 }
 
-                org.bukkit.Location loc = world.getSpawnLocation();
+                org.bukkit.Location loc = null;
+                if (entry.isReturnToLastLocation() && worldProfileManager != null) {
+                    loc = worldProfileManager.getLastLocation(target.getUniqueId(), world);
+                }
+                if (loc == null) {
+                    loc = world.getSpawnLocation();
+                }
 
                 // same motion-sickness-friendly teleport as in WarpsGuiListener
                 target.addPotionEffect(new org.bukkit.potion.PotionEffect(
@@ -3376,10 +3401,11 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                         1.0f
                 );
                 final Player finalTarget = target;
+                final org.bukkit.Location finalLoc = loc;
                 getServer().getScheduler().runTaskLater(
                         this,
                         () -> {
-                            finalTarget.teleport(loc);
+                            finalTarget.teleport(finalLoc);
                             finalTarget.sendMessage("§aSwitched to world §e" + entry.getName() + "§a.");
                         },
                         3L
@@ -3401,7 +3427,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                     return true;
                 }
                 if (args.length < 3) {
-                    sender.sendMessage("§7Usage: §e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+                    sender.sendMessage("§7Usage: §e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode|position> ...");
                     return true;
                 }
 
@@ -3646,9 +3672,33 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                         return true;
                     }
 
+                    case "position": {
+                        if (args.length < 4) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " position <last|spawn>");
+                            return true;
+                        }
+                        String posArg = args[3].toLowerCase();
+                        Boolean returnToLast = null;
+                        if (posArg.startsWith("last")) {
+                            returnToLast = Boolean.TRUE;
+                        } else if (posArg.startsWith("spawn")) {
+                            returnToLast = Boolean.FALSE;
+                        }
+                        if (returnToLast == null) {
+                            sender.sendMessage("§7Usage: §e/world edit " + worldName + " position <last|spawn>");
+                            return true;
+                        }
+
+                        entry.setReturnToLastLocation(returnToLast);
+                        worldManager.saveSafely();
+                        sender.sendMessage("§aWorld §e" + entry.getName() + "§a now returns players to their "
+                                + (returnToLast ? "§alast known position§a." : "§cworld spawn§a."));
+                        return true;
+                    }
+
                     default: {
                         sender.sendMessage("§7Usage: §e/world edit " + worldName
-                                + " <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+                                + " <rename|access|icon|order|delete|inv|stats|reset|gamemode|position> ...");
                         return true;
                     }
                 }
@@ -3658,7 +3708,7 @@ public class KavexLinkPlugin extends JavaPlugin implements Listener, TabComplete
                 sender.sendMessage("§7World commands:");
                 sender.sendMessage("§e/world create <name> <mode> <access> [icon] [seed...]");
                 sender.sendMessage("§e/world tp <name> [player]");
-                sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode> ...");
+                sender.sendMessage("§e/world edit <name> <rename|access|icon|order|delete|inv|stats|reset|gamemode|position> ...");
                 return true;
             }
         }
