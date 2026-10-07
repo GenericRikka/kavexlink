@@ -12,8 +12,7 @@ repositories {
 }
 
 dependencies {
-    //compileOnly("io.papermc.paper:paper-api:26.2.local-SNAPSHOT")
-    compileOnly("io.papermc.paper:paper-api:26.1.2.build.+")
+    compileOnly("io.papermc.paper:paper-api:26.3.build.+")
 }
 
 java {

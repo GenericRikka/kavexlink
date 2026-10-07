@@ -1,7 +1,7 @@
 name: KavexWarp
 version: '1.0'
 main: net.kavocado.kavexwarp.KavexWarpPlugin
-api-version: '1.21'
+api-version: '26.3'
 description: Public and private warps with a GUI.
 author: Rikka
 
